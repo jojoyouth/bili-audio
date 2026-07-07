@@ -216,7 +216,8 @@ def warm_bilibili_cookie_jar(timeout: float) -> None:
         cookie_jar_path(),
         "https://www.bilibili.com/",
     ]
-    subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False)
+    subprocess.run(command, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.PIPE, check=False)
 
 
 def fetch_page_with_urllib(url: str, timeout: float) -> dict[str, Any]:
@@ -230,7 +231,8 @@ def fetch_page_with_urllib(url: str, timeout: float) -> dict[str, Any]:
                 "Bilibili 回應 412，通常是反爬檢查。可以稍後再試，"
                 "或設定 BILIBILI_COOKIE 後重跑。"
             ) from exc
-        raise SystemExit(f"Bilibili API HTTP 錯誤：{exc.code} {exc.reason}") from exc
+        raise SystemExit(
+            f"Bilibili API HTTP 錯誤：{exc.code} {exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise SystemExit(f"連不上 Bilibili API：{exc.reason}") from exc
     except json.JSONDecodeError as exc:
@@ -318,7 +320,8 @@ def choose_with_fzf(videos: list[Video]) -> Video | None:
 
 
 def print_json(videos: list[Video]) -> None:
-    print(json.dumps([video.as_dict() for video in videos], ensure_ascii=False, indent=2))
+    print(json.dumps([video.as_dict()
+          for video in videos], ensure_ascii=False, indent=2))
 
 
 def require_command(command: str, install_hint: str) -> str:
@@ -371,6 +374,7 @@ def play_audio(video: Video, args: argparse.Namespace) -> int:
         mpv,
         "--no-video",
         "--force-window=no",
+        f"--volume={args.volume}",
         *mpv_ytdl_options(args),
         "--",
         video.url,
@@ -386,16 +390,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("keyword", nargs="*", help="搜尋關鍵字；留空會互動詢問")
     parser.add_argument("-p", "--pages", type=int, default=1, help="搜尋頁數，預設 1")
-    parser.add_argument("-n", "--limit", type=int, default=0, help="最多顯示幾筆；0 表示不限制")
-    parser.add_argument("--json", action="store_true", help="只輸出搜尋結果 JSON，不進入 fzf")
+    parser.add_argument("-n", "--limit", type=int,
+                        default=0, help="最多顯示幾筆；0 表示不限制")
+    parser.add_argument("--json", action="store_true",
+                        help="只輸出搜尋結果 JSON，不進入 fzf")
     parser.add_argument("--first", action="store_true", help="直接選第一筆，不進入 fzf")
     parser.add_argument("--print-url", action="store_true", help="選擇後只印出影片頁網址")
-    parser.add_argument("--direct-url", action="store_true", help="選擇後用 yt-dlp 印出音訊串流網址")
-    parser.add_argument("--format", default="bestaudio/best", help="yt-dlp 格式，預設 bestaudio/best")
-    parser.add_argument("--cookies-from-browser", help="讓 yt-dlp/mpv 讀瀏覽器 cookies，例如 chrome")
-    parser.add_argument("--cookies", help="Netscape cookies.txt 路徑，給 yt-dlp/mpv 使用")
+    parser.add_argument("--direct-url", action="store_true",
+                        help="選擇後用 yt-dlp 印出音訊串流網址")
+    parser.add_argument("--format", default="bestaudio/best",
+                        help="yt-dlp 格式，預設 bestaudio/best")
+    parser.add_argument("--cookies-from-browser",
+                        help="讓 yt-dlp/mpv 讀瀏覽器 cookies，例如 chrome")
+    parser.add_argument(
+        "--cookies", help="Netscape cookies.txt 路徑，給 yt-dlp/mpv 使用")
     parser.add_argument("--mpv", help="指定 mpv 路徑")
-    parser.add_argument("--timeout", type=float, default=12.0, help="API 逾時秒數，預設 12")
+    parser.add_argument("--timeout", type=float,
+                        default=12.0, help="API 逾時秒數，預設 12")
+    parser.add_argument("--volume", type=int, default=40,
+                        help="mpv volume (0-100)",)
     args = parser.parse_args(argv)
 
     if args.pages < 1:

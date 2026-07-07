@@ -38,6 +38,10 @@ cd 小玩具/bili_audio
 
 # 用 yt-dlp 取直接音訊串流網址
 ./bili_audio.py "lofi" --direct-url
+
+# 用 --volume 調整音量，範圍 0-100，預設 40
+
+./bili_audio.py "lofi" --volume 20
 ```
 
 如果影片需要登入狀態，可以讓 `mpv` / `yt-dlp` 讀瀏覽器 cookies：
