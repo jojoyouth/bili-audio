@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -52,8 +53,24 @@ class Video:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class FzfResult:
+    action: str
+    video: Video | None = None
+
+
+FZF_PLAY = "play"
+FZF_CANCEL = "cancel"
+FZF_NEXT_PAGE = "next-page"
+FZF_PREV_PAGE = "prev-page"
+
+
 def eprint(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def is_interrupt_returncode(returncode: int) -> bool:
+    return returncode in (130, -signal.SIGINT)
 
 
 def clean_text(value: Any) -> str:
@@ -156,9 +173,13 @@ def fetch_page(keyword: str, page: int, timeout: float) -> dict[str, Any]:
 
 def fetch_page_with_curl(url: str, timeout: float) -> dict[str, Any]:
     result = run_curl_json(url, timeout)
+    if is_interrupt_returncode(result.returncode):
+        raise KeyboardInterrupt
     if result.returncode != 0 and "412" in result.stderr and not env_cookie():
         warm_bilibili_cookie_jar(timeout)
         result = run_curl_json(url, timeout)
+        if is_interrupt_returncode(result.returncode):
+            raise KeyboardInterrupt
 
     if result.returncode != 0:
         if "412" in result.stderr:
@@ -239,33 +260,63 @@ def fetch_page_with_urllib(url: str, timeout: float) -> dict[str, Any]:
         raise SystemExit("Bilibili API 回傳不是有效 JSON。") from exc
 
 
-def search_videos(keyword: str, pages: int, timeout: float) -> list[Video]:
+def video_key(video: Video) -> str:
+    return video.bvid or video.aid or video.url
+
+
+def fetch_video_page(
+    keyword: str,
+    page: int,
+    timeout: float,
+    seen: set[str],
+) -> tuple[list[Video], bool]:
+    payload = fetch_page(keyword, page, timeout)
+    if payload.get("code") != 0:
+        message = payload.get("message") or "unknown error"
+        raise SystemExit(f"Bilibili API 錯誤：{message}")
+
+    results = payload.get("data", {}).get("result", [])
+    if not results:
+        return [], False
+
     videos: list[Video] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        video = make_video(item)
+        if not video:
+            continue
+        key = video_key(video)
+        if key in seen:
+            continue
+        seen.add(key)
+        videos.append(video)
+
+    return videos, True
+
+
+def search_video_pages(keyword: str, pages: int, timeout: float) -> list[list[Video]]:
+    video_pages: list[list[Video]] = []
     seen: set[str] = set()
 
     for page in range(1, pages + 1):
-        payload = fetch_page(keyword, page, timeout)
-        if payload.get("code") != 0:
-            message = payload.get("message") or "unknown error"
-            raise SystemExit(f"Bilibili API 錯誤：{message}")
-
-        results = payload.get("data", {}).get("result", [])
-        if not results:
+        videos, has_results = fetch_video_page(keyword, page, timeout, seen)
+        if not has_results:
             break
+        video_pages.append(videos)
 
-        for item in results:
-            if not isinstance(item, dict):
-                continue
-            video = make_video(item)
-            if not video:
-                continue
-            key = video.bvid or video.aid or video.url
-            if key in seen:
-                continue
-            seen.add(key)
-            videos.append(video)
+    return video_pages
 
+
+def flatten_video_pages(video_pages: list[list[Video]], limit: int = 0) -> list[Video]:
+    videos = [video for page in video_pages for video in page]
+    if limit:
+        return videos[:limit]
     return videos
+
+
+def search_videos(keyword: str, pages: int, timeout: float) -> list[Video]:
+    return flatten_video_pages(search_video_pages(keyword, pages, timeout))
 
 
 def render_fzf_rows(videos: list[Video]) -> str:
@@ -287,19 +338,43 @@ def render_fzf_rows(videos: list[Video]) -> str:
     return "\n".join(rows) + "\n"
 
 
-def choose_with_fzf(videos: list[Video]) -> Video | None:
+def parse_fzf_result(output: str, videos: list[Video]) -> FzfResult:
+    lines = output.splitlines()
+    if not lines:
+        return FzfResult(FZF_CANCEL)
+
+    key = lines[0].strip()
+    if key in ("ctrl-f", "alt-n"):
+        return FzfResult(FZF_NEXT_PAGE)
+    if key in ("ctrl-b", "alt-p"):
+        return FzfResult(FZF_PREV_PAGE)
+
+    row = lines[1] if key in ("", "enter") and len(lines) > 1 else lines[0]
+    index_text = row.split("\t", 1)[0].strip()
+    try:
+        return FzfResult(FZF_PLAY, videos[int(index_text)])
+    except (ValueError, IndexError):
+        raise SystemExit("fzf 回傳了無法解析的選項。")
+
+
+def run_fzf(videos: list[Video], header: str, paging: bool = False) -> FzfResult:
     if not shutil.which("fzf"):
         raise SystemExit("找不到 fzf。可以先安裝：brew install fzf")
+
+    expected_keys = "enter"
+    if paging:
+        expected_keys = "enter,ctrl-f,ctrl-b,alt-n,alt-p"
 
     fzf = [
         "fzf",
         "--delimiter=\t",
         "--with-nth=2,3,4,5,6,7",
+        f"--expect={expected_keys}",
         "--prompt=Bilibili> ",
         "--height=85%",
         "--layout=reverse",
         "--border",
-        "--header=Enter 播放 / Esc 取消",
+        f"--header={header}",
     ]
 
     result = subprocess.run(
@@ -310,13 +385,16 @@ def choose_with_fzf(videos: list[Video]) -> Video | None:
         check=False,
     )
     if result.returncode != 0 or not result.stdout.strip():
-        return None
+        return FzfResult(FZF_CANCEL)
 
-    index_text = result.stdout.split("\t", 1)[0].strip()
-    try:
-        return videos[int(index_text)]
-    except (ValueError, IndexError):
-        raise SystemExit("fzf 回傳了無法解析的選項。")
+    return parse_fzf_result(result.stdout, videos)
+
+
+def choose_with_fzf(videos: list[Video]) -> Video | None:
+    result = run_fzf(videos, "Enter 播放 / Esc 取消")
+    if result.action != FZF_PLAY:
+        return None
+    return result.video
 
 
 def print_json(videos: list[Video]) -> None:
@@ -362,7 +440,10 @@ def print_direct_url(video: Video, args: argparse.Namespace) -> int:
         "--get-url",
         video.url,
     ]
-    return subprocess.run(command, check=False).returncode
+    returncode = subprocess.run(command, check=False).returncode
+    if is_interrupt_returncode(returncode):
+        raise KeyboardInterrupt
+    return returncode
 
 
 def play_audio(video: Video, args: argparse.Namespace) -> int:
@@ -381,7 +462,79 @@ def play_audio(video: Video, args: argparse.Namespace) -> int:
     ]
     eprint(f"播放：{video.title}")
     eprint(video.url)
-    return subprocess.run(command, check=False).returncode
+    try:
+        returncode = subprocess.run(command, check=False).returncode
+    except KeyboardInterrupt:
+        raise
+    if is_interrupt_returncode(returncode):
+        raise KeyboardInterrupt
+    return returncode
+
+
+def seen_video_keys(video_pages: list[list[Video]]) -> set[str]:
+    return {video_key(video) for page in video_pages for video in page}
+
+
+def load_next_video_page(
+    keyword: str,
+    args: argparse.Namespace,
+    video_pages: list[list[Video]],
+) -> bool:
+    next_page = len(video_pages) + 1
+    videos, has_results = fetch_video_page(
+        keyword,
+        next_page,
+        args.timeout,
+        seen_video_keys(video_pages),
+    )
+    if not has_results:
+        return False
+    video_pages.append(videos)
+    return True
+
+
+def interactive_playback(
+    keyword: str,
+    args: argparse.Namespace,
+    video_pages: list[list[Video]],
+) -> int:
+    current_page = 0
+
+    while True:
+        videos = video_pages[current_page]
+        if args.limit:
+            videos = videos[: args.limit]
+        header = (
+            "Enter 播放 / Ctrl-F 下一頁 / Ctrl-B 上一頁 / Esc 離開 "
+            f"/ 第 {current_page + 1} 頁 {len(videos)} 筆"
+        )
+        result = run_fzf(videos, header, paging=True)
+
+        if result.action == FZF_CANCEL:
+            eprint("已取消。")
+            return 130
+        if result.action == FZF_NEXT_PAGE:
+            if current_page + 1 < len(video_pages):
+                current_page += 1
+                continue
+            if load_next_video_page(keyword, args, video_pages):
+                current_page += 1
+                eprint(f"已載入第 {current_page + 1} 頁。")
+            else:
+                eprint("沒有更多結果。")
+            continue
+        if result.action == FZF_PREV_PAGE:
+            if current_page > 0:
+                current_page -= 1
+            else:
+                eprint("已經在第一頁。")
+            continue
+        if result.action == FZF_PLAY and result.video:
+            play_audio(result.video, args)
+            continue
+
+        eprint("已取消。")
+        return 130
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -429,9 +582,8 @@ def main(argv: list[str] | None = None) -> int:
     if not keyword:
         raise SystemExit("需要輸入搜尋關鍵字。")
 
-    videos = search_videos(keyword, args.pages, args.timeout)
-    if args.limit:
-        videos = videos[: args.limit]
+    video_pages = search_video_pages(keyword, args.pages, args.timeout)
+    videos = flatten_video_pages(video_pages, args.limit)
     if not videos:
         eprint("找不到影片。")
         return 1
@@ -439,6 +591,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print_json(videos)
         return 0
+
+    if not (args.first or args.print_url or args.direct_url):
+        return interactive_playback(keyword, args, video_pages)
 
     video = videos[0] if args.first else choose_with_fzf(videos)
     if not video:
@@ -454,4 +609,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\n已中斷。", file=sys.stderr)
+        raise SystemExit(130)
