@@ -4,32 +4,49 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import fcntl
 import html
 import json
 import math
 import os
+from pathlib import Path
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
+import time
+from collections.abc import Callable
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
 
 from bili_backend import BiliCliBackend, BiliCliError, find_bili_cli
+from bili_auth import Session, login_qr, session_path
 
 SEARCH_API_URL = "https://api.bilibili.com/x/web-interface/search/type"
 HOT_API_URL = "https://api.bilibili.com/x/web-interface/popular"
 RANK_API_URL = "https://api.bilibili.com/x/web-interface/ranking/v2"
 USER_CARD_API_URL = "https://api.bilibili.com/x/web-interface/card"
+RECOMMEND_API_URL = "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd"
+WATCHLATER_API_URL = "https://api.bilibili.com/x/v2/history/toview"
+FAV_FOLDERS_API_URL = "https://api.bilibili.com/x/v3/fav/folder/created/list-all"
+FAV_RESOURCE_API_URL = "https://api.bilibili.com/x/v3/fav/resource/list"
+FAV_PAGE_SIZE = 20
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 UNLIMITED_PAGE_COUNT = 100
+# Bursts of back-to-back calls are what trips Bilibili risk control, so space them out.
+MIN_API_INTERVAL = 0.8
+_last_api_call = 0.0
+HISTORY_LIMIT = 200
+_history_warned = False
 OSC_SEQUENCE_RE = re.compile(
     r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|$)",
     re.DOTALL,
@@ -43,6 +60,7 @@ TERMINAL_CONTROL_RE = re.compile(
     r"\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]"
 )
 _COOKIE_TEMP_DIR: tempfile.TemporaryDirectory[str] | None = None
+_AUTH_SESSION: Session | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,6 +112,7 @@ class UserSummary:
 class FzfResult:
     action: str
     video: Video | None = None
+    selected: tuple[Video, ...] = ()
 
 
 FZF_PLAY = "play"
@@ -102,6 +121,7 @@ FZF_PLAY_VIDEO = "play-video"
 FZF_CANCEL = "cancel"
 FZF_NEXT_PAGE = "next-page"
 FZF_PREV_PAGE = "prev-page"
+FZF_REFRESH = "refresh"
 
 
 def eprint(message: str) -> None:
@@ -261,10 +281,30 @@ def make_user(item: dict[str, Any]) -> UserSummary | None:
     )
 
 
+def pace_api_calls() -> None:
+    global _last_api_call
+    remaining = MIN_API_INTERVAL - (time.monotonic() - _last_api_call)
+    if remaining > 0:
+        time.sleep(remaining)
+    _last_api_call = time.monotonic()
+
+
+def terminal_cells() -> tuple[int, int] | None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            packed = fcntl.ioctl(stream.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+        except (OSError, ValueError, AttributeError):
+            continue
+        rows, cols, _, _ = struct.unpack("HHHH", packed)
+        if cols and rows:
+            return cols, rows
+    return None
+
+
 def request_headers() -> dict[str, str]:
     headers = {
         "User-Agent": os.environ.get("BILI_USER_AGENT", DEFAULT_USER_AGENT),
-        "Referer": "https://search.bilibili.com/",
+        "Referer": "https://www.bilibili.com/",
         "Accept": "application/json,text/plain,*/*",
     }
 
@@ -273,6 +313,112 @@ def request_headers() -> dict[str, str]:
         headers["Cookie"] = cookie
 
     return headers
+
+
+def config_dir() -> Path:
+    return session_path().parent
+
+
+def history_path() -> Path:
+    return config_dir() / "history.json"
+
+
+def watch_later_dir() -> Path:
+    """mpv keeps resume positions here, keyed by the video URL."""
+    return config_dir() / "watch-later"
+
+
+def load_history() -> list[dict[str, Any]]:
+    """A damaged or hand-edited file must not take the whole command down."""
+    global _history_warned
+    try:
+        raw = history_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError:
+        if not _history_warned:
+            eprint("無法讀取本機播放紀錄，這次先當成空清單。")
+            _history_warned = True
+        return []
+    try:
+        entries = json.loads(raw)
+    except ValueError:
+        if not _history_warned:
+            eprint(f"本機播放紀錄格式不正確，已忽略：{history_path()}")
+            _history_warned = True
+        return []
+    if not isinstance(entries, list):
+        return []
+    clean = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        bvid = entry.get("bvid")
+        if not isinstance(bvid, str) or not re.fullmatch(r"BV[0-9A-Za-z]{10}", bvid):
+            continue
+        clean.append({
+            "bvid": bvid,
+            "title": clean_text(str(entry.get("title", ""))),
+            "author": clean_text(str(entry.get("author", ""))),
+            "started": entry.get("started") if isinstance(entry.get("started"), str) else "",
+        })
+    return clean[:HISTORY_LIMIT]
+
+
+def write_history(entries: list[dict[str, Any]]) -> None:
+    target = history_path()
+    target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(prefix=".history-", dir=str(target.parent))
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as output:
+            json.dump(entries[:HISTORY_LIMIT], output, ensure_ascii=False, indent=1)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def record_history(video: Video) -> None:
+    """Records that playback started. Never blocks playback, and never claims it finished."""
+    if not re.fullmatch(r"BV[0-9A-Za-z]{10}", video.bvid or ""):
+        return
+    entry = {
+        "bvid": video.bvid,
+        "title": video.title,
+        "author": video.author,
+        "started": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    try:
+        entries = [item for item in load_history() if item["bvid"] != video.bvid]
+        write_history([entry] + entries)
+    except OSError as exc:
+        eprint(f"播放紀錄寫入失敗，不影響播放：{exc}")
+
+
+def clear_history() -> int:
+    try:
+        history_path().unlink(missing_ok=True)
+    except OSError as exc:
+        raise SystemExit("無法清除本機播放紀錄，請確認設定目錄權限。") from exc
+    return 0
+
+
+def videos_from_history(entries: list[dict[str, Any]]) -> list[Video]:
+    return [
+        Video(
+            title=entry["title"] or entry["bvid"],
+            author=entry["author"],
+            bvid=entry["bvid"],
+            aid="",
+            url=f"https://www.bilibili.com/video/{entry['bvid']}",
+            duration="",
+            play=0,
+            pubdate=None,
+            description=f"上次播放：{entry['started']}" if entry["started"] else "",
+        )
+        for entry in entries
+    ]
 
 
 def env_cookie() -> str | None:
@@ -293,6 +439,8 @@ def cookie_jar_path() -> str:
 
 
 def fetch_json_url(url: str, timeout: float) -> dict[str, Any]:
+    if _AUTH_SESSION is not None:
+        return _AUTH_SESSION.request(url, timeout)
     if shutil.which("curl"):
         return fetch_page_with_curl(url, timeout)
     return fetch_page_with_urllib(url, timeout)
@@ -375,7 +523,9 @@ def require_api_success(payload: dict[str, Any]) -> None:
         raise SystemExit(
             "Bilibili 回應 429，請降低查詢頻率並稍後再試。"
         )
-    message = payload.get("message") or payload.get("msg") or "unknown error"
+    if code == -101:
+        raise SystemExit("登入已失效，請重新執行 login。")
+    message = clean_text(payload.get("message") or payload.get("msg") or "unknown error")
     raise SystemExit(f"Bilibili API 錯誤：{message}")
 
 
@@ -707,6 +857,7 @@ def render_fzf_rows(videos: list[Video]) -> str:
                     format_count(video.like),
                     format_pubdate(video.pubdate),
                     table_field(video.bvid or video.aid),
+                    table_field(video.description or "沒有影片簡介"),
                 ]
             )
         )
@@ -723,6 +874,8 @@ def parse_fzf_result(output: str, videos: list[Video]) -> FzfResult:
         return FzfResult(FZF_NEXT_PAGE)
     if key in ("ctrl-b", "alt-p"):
         return FzfResult(FZF_PREV_PAGE)
+    if key == "ctrl-r":
+        return FzfResult(FZF_REFRESH)
     if key == "ctrl-a":
         action = FZF_PLAY_AUDIO
     elif key in ("ctrl-v", "alt-v"):
@@ -730,12 +883,44 @@ def parse_fzf_result(output: str, videos: list[Video]) -> FzfResult:
     else:
         action = FZF_PLAY
 
-    row = lines[1] if len(lines) > 1 else lines[0]
-    index_text = row.split("\t", 1)[0].strip()
     try:
-        return FzfResult(action, videos[int(index_text)])
+        rows = lines[1:] if len(lines) > 1 else lines
+        indexes = [int(row.split("\t", 1)[0].strip()) for row in rows]
+        if any(index < 0 or index >= len(videos) for index in indexes):
+            raise IndexError
+        selected = tuple(videos[index] for index in indexes)
+        return FzfResult(action, selected[0], selected)
     except (ValueError, IndexError):
         raise SystemExit("fzf 回傳了無法解析的選項。")
+
+
+FZF_HELP_ENV = "BILI_AUDIO_FZF_HELP"
+FZF_PREVIEW = (
+    "printf '%s\\n作者：%s | 長度：%s | 觀看：%s\\n%s\\n' {2} {3} {4} {5} {9}"
+)
+
+
+def fzf_help_text(paging: bool, playback_keys: bool, refresh: bool) -> str:
+    lines = ["清單按鍵", "  Enter 播放    Esc 取消    ? 這份說明"]
+    if playback_keys:
+        lines.append("  Tab 多選連播  Ctrl-A 只聽音訊  Ctrl-V 終端影片  Alt-V 視窗播放")
+    if paging:
+        lines.append("  Ctrl-F／Alt-N 下一頁    Ctrl-B／Alt-P 上一頁")
+    if refresh:
+        lines.append("  Ctrl-R 換一批")
+    lines += [
+        "",
+        "常用參數",
+        "  --play-mode audio|video|window   --video-output kitty|tct",
+        "  --stealth 隱蔽播放（mpv 內按 b 收畫面）   --max-height 480 降來源畫質",
+        "  --volume 0-100   --audio-device 裝置   -n／--limit 筆數   --json",
+        "",
+        "全部參數：./bili_audio.py completion --list",
+        "shell 補全：eval \"$(./bili_audio.py completion zsh)\"",
+        "",
+        "移動游標即可回到影片簡介。",
+    ]
+    return "\n".join(lines)
 
 
 def run_fzf(
@@ -743,6 +928,7 @@ def run_fzf(
     header: str,
     paging: bool = False,
     playback_keys: bool = False,
+    refresh: bool = False,
 ) -> FzfResult:
     if not shutil.which("fzf"):
         raise SystemExit("找不到 fzf。可以先安裝：brew install fzf")
@@ -752,6 +938,8 @@ def run_fzf(
         expected_keys = "enter,ctrl-a,ctrl-v,alt-v"
     if paging:
         expected_keys += ",ctrl-f,ctrl-b,alt-n,alt-p"
+    if refresh:
+        expected_keys += ",ctrl-r"
 
     fzf = [
         "fzf",
@@ -763,7 +951,16 @@ def run_fzf(
         "--layout=reverse",
         "--border",
         f"--header={header}",
+        f"--preview={FZF_PREVIEW}",
+        "--preview-window=down,4,wrap",
+        # ? swaps the preview for a key and parameter reference; moving restores it.
+        f"--bind=?:change-preview-window(down,16,wrap)+change-preview:"
+        f'printf \'%s\\n\' "${FZF_HELP_ENV}"',
+        f"--bind=up:up+change-preview-window(down,4,wrap)+change-preview:{FZF_PREVIEW}",
+        f"--bind=down:down+change-preview-window(down,4,wrap)+change-preview:{FZF_PREVIEW}",
     ]
+    if playback_keys:
+        fzf.append("--multi")
 
     result = subprocess.run(
         fzf,
@@ -771,7 +968,10 @@ def run_fzf(
         text=True,
         stdout=subprocess.PIPE,
         check=False,
+        env={**os.environ, FZF_HELP_ENV: fzf_help_text(paging, playback_keys, refresh)},
     )
+    if result.returncode not in (0, 1, 130, -signal.SIGINT):
+        raise SystemExit(f"fzf 無法開啟清單（exit {result.returncode}），請確認 terminal 可用。")
     if result.returncode != 0 or not result.stdout.strip():
         return FzfResult(FZF_CANCEL)
 
@@ -779,7 +979,7 @@ def run_fzf(
 
 
 def choose_with_fzf(videos: list[Video]) -> Video | None:
-    result = run_fzf(videos, "Enter 播放 / Esc 取消")
+    result = run_fzf(videos, "Enter 播放 / Esc 取消 / ? 說明")
     if result.action not in (FZF_PLAY, FZF_PLAY_AUDIO, FZF_PLAY_VIDEO):
         return None
     return result.video
@@ -870,13 +1070,32 @@ def terminal_video_output(requested: str = "auto") -> str:
         and (
             os.environ.get("KITTY_WINDOW_ID")
             or "kitty" in term
-            or "wezterm" in term_program
-            or "ghostty" in term_program
-            or os.environ.get("WEZTERM_PANE")
+            or term_program == "kitty"
         )
     ):
         return "kitty"
     return "tct"
+
+
+def terminal_supports_kitty_shm() -> bool:
+    """Only kitty itself reads frames out of shared memory. Ghostty and WezTerm
+    speak the graphics protocol but ignore the shm transmission, so enabling it
+    there leaves the picture blank instead of making it faster."""
+    if any(os.environ.get(name) for name in ("TMUX", "STY", "ZELLIJ")):
+        return False
+    return bool(
+        os.environ.get("KITTY_WINDOW_ID")
+        or os.environ.get("TERM", "").lower() == "xterm-kitty"
+        or os.environ.get("TERM_PROGRAM", "").lower() == "kitty"
+    )
+
+
+def resolve_kitty_shm(requested: str) -> bool:
+    if requested == "yes":
+        return True
+    if requested == "no":
+        return False
+    return terminal_supports_kitty_shm()
 
 
 def probe_mpv_video_outputs(mpv: str) -> set[str]:
@@ -921,6 +1140,39 @@ def terminal_is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
+def terminal_ytdl_format(args: argparse.Namespace) -> str:
+    """Highest available stream by default; --max-height trades detail for throughput."""
+    max_height = getattr(args, "max_height", 0) or 0
+    if max_height <= 0:
+        return "bestvideo+bestaudio/best"
+    return f"bestvideo[height<=?{max_height}]+bestaudio/best"
+
+
+def stealth_kitty_placement() -> list[str]:
+    """A quarter-size picture parked in the bottom-right corner."""
+    cells = terminal_cells()
+    if not cells:
+        return ["--vo-kitty-cols=24", "--vo-kitty-rows=10"]
+    cols, rows = cells
+    width = max(16, cols // 4)
+    height = max(6, rows // 4)
+    return [
+        f"--vo-kitty-cols={width}",
+        f"--vo-kitty-rows={height}",
+        f"--vo-kitty-left={max(1, cols - width)}",
+        f"--vo-kitty-top={max(1, rows - height)}",
+    ]
+
+
+def watch_later_directory_for_mpv() -> str:
+    directory = watch_later_dir()
+    try:
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        eprint(f"無法建立續播位置目錄，這次不保存播放位置：{exc}")
+    return str(directory)
+
+
 def build_mpv_command(
     video: Video,
     args: argparse.Namespace,
@@ -937,26 +1189,64 @@ def build_mpv_command(
         "--referrer=https://www.bilibili.com/",
         f"--user-agent={os.environ.get('BILI_USER_AGENT', DEFAULT_USER_AGENT)}",
         f"--volume={args.volume}",
+        "--mute=no",
+        "--aid=auto",
+        "--osd-duration=2000",
+        "--input-conf=" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "mpv-input.conf"),
+        f"--audio-device={getattr(args, 'audio_device', 'auto')}",
+        f"--network-timeout={getattr(args, 'timeout', 20)}",
+        f"--ytdl-raw-options-append=socket-timeout={getattr(args, 'timeout', 20)}",
+        "--ytdl-raw-options-append=retries=1",
+        # mpv's own resume: it saves on quit and drops the file when a video plays out,
+        # so nothing here ever marks a video as finished on our behalf.
+        "--save-position-on-quit=yes",
+        f"--watch-later-directory={watch_later_directory_for_mpv()}",
         *mpv_ytdl_options(args),
     ]
     if mode == "audio":
         command.append("--no-video")
+    elif mode == "window":
+        command.extend(["--no-config", "--force-window=yes", "--osc=yes",
+                        "--osd-level=1", "--ytdl-format=bestvideo+bestaudio/best"])
     else:
         video_output = resolved_video_output or terminal_video_output(
             args.video_output
         )
+        stealth = getattr(args, "stealth", False)
         command.extend(
             [
                 "--no-config",
                 f"--vo={video_output}",
                 "--profile=sw-fast",
-                "--really-quiet",
-                "--osd-level=0",
+                # CoreText probes a reserved PingFangUI.ttc on macOS and logs an
+                # error each time before falling back to a font that works.
+                "--msg-level=all=info,osd/libass=fatal",
+                f"--ytdl-format={terminal_ytdl_format(args)}",
+                "--osc=no",
                 "--term-status-msg=",
             ]
         )
+        if video_output == "kitty":
+            # Shared memory keeps whole frames off the PTY: base64 costs ~230 KB per
+            # frame. Only kitty reads it, so anywhere else this must stay off or the
+            # picture never appears.
+            use_shm = resolve_kitty_shm(getattr(args, "kitty_shm", "auto"))
+            command.append(f"--vo-kitty-use-shm={'yes' if use_shm else 'no'}")
         if video_output == "tct":
             command.append("--vo-tct-buffering=frame")
+        if stealth:
+            command.extend([
+                "--osd-level=0",
+                "--term-playing-msg=",
+                "--term-title=",
+            ])
+            if video_output == "kitty":
+                command.extend(stealth_kitty_placement())
+        else:
+            command.extend([
+                "--osd-level=1",
+                "--osd-msg1=${playback-time} / ${duration} | 音量 ${volume}% | ${?mute==yes:靜音}${?mute==no:有聲} | ${?pause==yes:暫停}${?pause==no:播放中}",
+            ])
     command.extend(["--", video.url])
     return command
 
@@ -991,20 +1281,27 @@ def play_audio(video: Video, args: argparse.Namespace) -> int:
     return returncode
 
 
-def play_video(video: Video, args: argparse.Namespace) -> int:
-    if not terminal_is_interactive():
+def play_video(video: Video, args: argparse.Namespace, mode: str = "video") -> int:
+    if mode == "video" and not terminal_is_interactive():
         raise SystemExit("terminal 影片模式需要互動式 TTY，不能輸出到 pipe。")
     mpv = find_mpv(args.mpv)
-    video_output = resolve_mpv_video_output(mpv, args.video_output)
+    video_output = resolve_mpv_video_output(mpv, args.video_output) if mode == "video" else None
     command = build_mpv_command(
         video,
         args,
-        "video",
+        mode,
         resolved_video_output=video_output,
         mpv_path=mpv,
     )
-    eprint(f"終端播放影片（{video_output}）：{video.title}")
-    eprint("mpv 快捷鍵：Space 暫停、←/→ 快退快進、q 離開")
+    eprint(f"終端播放影片（{video_output}）：{video.title}" if mode == "video"
+           else f"視窗播放影片：{video.title}")
+    eprint("正在解析與載入影片；若持續沒有畫面，按 Ctrl-C 中止。")
+    if not getattr(args, "stealth", False):
+        if video_output == "kitty":
+            eprint("若 kitty 沒有畫面，可重開並指定 --video-output tct。")
+        eprint("mpv：Space 暫停、←/→ 快退快進、9/0 音量、m 靜音、b 收畫面、q 離開")
+    if mode == "video":
+        eprint("terminal 內用鍵盤控制；需要滑鼠控制列請改用 --play-mode window。")
     eprint(video.url)
     try:
         returncode = subprocess.run(command, check=False).returncode
@@ -1020,14 +1317,15 @@ def play_selected(
     args: argparse.Namespace,
     action: str = FZF_PLAY,
 ) -> int:
+    record_history(video)
     if action == FZF_PLAY_AUDIO:
         mode = "audio"
     elif action == FZF_PLAY_VIDEO:
         mode = "video"
     else:
         mode = args.play_mode
-    if mode == "video":
-        return play_video(video, args)
+    if mode in ("video", "window"):
+        return play_video(video, args) if mode == "video" else play_video(video, args, mode="window")
     return play_audio(video, args)
 
 
@@ -1060,27 +1358,30 @@ def interactive_playback(
     title: str,
     source: BiliSource | None = None,
     keyword: str | None = None,
+    page_loader: Callable[[int], list[Video]] | None = None,
 ) -> int:
     current_page = 0
-    can_load_pages = source is not None and keyword is not None
+    can_load_pages = page_loader is not None or (source is not None and keyword is not None)
     can_page = len(video_pages) > 1 or can_load_pages
 
     while True:
         videos = video_pages[current_page]
         if args.limit:
             videos = videos[: args.limit]
-        controls = "Enter 預設 / Ctrl-A 音訊 / Ctrl-V 影片 / Esc 離開"
+        controls = "Tab 多選 / Enter 播放 / Ctrl-A 音訊 / Ctrl-V 影片\nEsc 離開 / ? 說明"
         if can_page:
             controls += " / Ctrl-F 下一頁 / Ctrl-B 上一頁"
+        if page_loader:
+            controls += " / Ctrl-R 換一批"
         header = (
-            f"{title} / {controls} / "
-            f"第 {current_page + 1} 頁 {len(videos)} 筆"
+            f"{title} / 第 {current_page + 1} 頁 {len(videos)} 筆\n{controls}"
         )
         result = run_fzf(
             videos,
             header,
             paging=can_page,
             playback_keys=True,
+            refresh=page_loader is not None,
         )
 
         if result.action == FZF_CANCEL:
@@ -1089,6 +1390,16 @@ def interactive_playback(
         if result.action == FZF_NEXT_PAGE:
             if current_page + 1 < len(video_pages):
                 current_page += 1
+                continue
+            if page_loader:
+                next_videos = page_loader(len(video_pages) + 1)
+                seen = seen_video_keys(video_pages)
+                next_videos = [v for v in next_videos if video_key(v) not in seen]
+                if next_videos:
+                    video_pages.append(next_videos)
+                    current_page += 1
+                else:
+                    eprint("這一批沒有新影片；可按 Ctrl-R 重新整理。")
                 continue
             if (
                 can_load_pages
@@ -1107,21 +1418,177 @@ def interactive_playback(
             else:
                 eprint("已經在第一頁。")
             continue
+        if result.action == FZF_REFRESH and page_loader:
+            refreshed = page_loader(current_page + 1)
+            if refreshed:
+                video_pages[current_page] = refreshed
+            else:
+                eprint("這一批沒有影片，保留原清單。")
+            continue
         if result.action in (FZF_PLAY, FZF_PLAY_AUDIO, FZF_PLAY_VIDEO) and result.video:
-            play_selected(result.video, args, result.action)
+            for video in result.selected or (result.video,):
+                if play_selected(video, args, result.action):
+                    eprint("播放失敗，已停止這批佇列並返回清單。")
+                    break
             continue
 
         eprint("已取消。")
         return 130
 
 
-COMMANDS = {"search", "users", "user", "hot", "rank", "backend-info"}
+# Must stay in step with build_parser's subcommands; test_commands_match_parser checks it.
+COMMANDS = {"search", "users", "user", "hot", "rank", "backend-info", "history",
+            "login", "logout", "status", "recommend", "home", "doctor", "completion",
+            "watchlater", "favorites", "install"}
+
+
+def parser_subcommands(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return dict(action.choices)
+    return {}
+
+
+def completion_table() -> list[tuple[str, list[str]]]:
+    """Command name plus its option flags, read straight off the parser."""
+    table = []
+    for name, subparser in sorted(parser_subcommands(build_parser()).items()):
+        flags = sorted({
+            option
+            for action in subparser._actions
+            for option in action.option_strings
+            if option.startswith("--")
+        })
+        table.append((name, flags))
+    return table
+
+
+CLI_NAME = "bili-audio"
+COMPLETION_TARGETS = (CLI_NAME, "bili_audio.py", "./bili_audio.py")
+
+
+def completion_script(shell: str, autoload: bool = False) -> str:
+    """autoload=True emits the #compdef form zsh picks up from fpath; otherwise
+    the script registers itself and can simply be sourced."""
+    table = completion_table()
+    names = " ".join(name for name, _ in table)
+    if shell == "bash":
+        cases = "\n".join(
+            f'    {name}) options="{" ".join(flags)}" ;;' for name, flags in table
+        )
+        return f"""# bili-audio bash completion
+# eval "$(./bili_audio.py completion bash)"
+_bili_audio_complete() {{
+  local current options
+  current="${{COMP_WORDS[COMP_CWORD]}}"
+  COMPREPLY=()
+  if [ "$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=($(compgen -W "{names}" -- "$current"))
+    return
+  fi
+  case "${{COMP_WORDS[1]}}" in
+{cases}
+    *) options="" ;;
+  esac
+  COMPREPLY=($(compgen -W "$options" -- "$current"))
+}}
+complete -F _bili_audio_complete bili_audio.py
+complete -F _bili_audio_complete ./bili_audio.py
+"""
+    cases = "\n".join(
+        f'      {name}) compadd -- {" ".join(flags)} ;;' for name, flags in table
+    )
+    targets = " ".join(COMPLETION_TARGETS)
+    body = f"""  if (( CURRENT == 2 )); then
+    compadd -- {names}
+    return
+  fi
+  case "${{words[2]}}" in
+{cases}
+  esac"""
+    if autoload:
+        # A file in fpath named _bili-audio: the body is the function itself.
+        return f"""#compdef {targets}
+# Generated by `{CLI_NAME} completion zsh`; regenerate after adding options.
+{body}
+"""
+    return f"""# bili-audio zsh completion
+# eval "$({CLI_NAME} completion zsh)"
+_bili_audio_complete() {{
+{body}
+}}
+compdef _bili_audio_complete {targets}
+"""
+
+
+def install_paths(prefix: str | None) -> tuple[Path, Path]:
+    """Both defaults are already on PATH and fpath, so no shell config needs editing."""
+    if prefix:
+        root = Path(prefix).expanduser()
+        return (root / "bin" / CLI_NAME,
+                root / "share" / "zsh" / "site-functions" / f"_{CLI_NAME}")
+    return (
+        Path.home() / ".local" / "bin" / CLI_NAME,
+        Path("/opt/homebrew/share/zsh/site-functions") / f"_{CLI_NAME}",
+    )
+
+
+def run_install(args: argparse.Namespace) -> int:
+    script = Path(__file__).resolve()
+    link, completion = install_paths(args.prefix)
+
+    if args.uninstall:
+        removed = []
+        for path in (link, completion):
+            try:
+                if path.is_symlink() or path.exists():
+                    path.unlink()
+                    removed.append(str(path))
+            except OSError as exc:
+                eprint(f"無法移除 {path}：{exc}")
+        print("已移除：\n  " + "\n  ".join(removed) if removed else "沒有找到已安裝的檔案。")
+        return 0
+
+    try:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(script)
+    except OSError as exc:
+        raise SystemExit(f"無法建立 {link}：{exc}") from exc
+    print(f"已安裝指令：{link} -> {script}")
+
+    try:
+        completion.parent.mkdir(parents=True, exist_ok=True)
+        completion.write_text(completion_script("zsh", autoload=True), encoding="utf-8")
+    except OSError as exc:
+        eprint(f"無法寫入補全檔 {completion}：{exc}")
+        print(f'補全可改用：eval "$({CLI_NAME} completion zsh)"')
+    else:
+        print(f"已安裝 zsh 補全：{completion}")
+        print(f"開一個新的 terminal 之後，{CLI_NAME} 加 Tab 就會列出子命令。")
+
+    if str(link.parent) not in os.environ.get("PATH", "").split(":"):
+        eprint(f"注意：{link.parent} 不在 PATH，請自行加入。")
+    print(f"要移除：{CLI_NAME} install --uninstall")
+    return 0
+
+
+def run_completion(args: argparse.Namespace) -> int:
+    if args.list:
+        for name, flags in completion_table():
+            print(name)
+            for flag in flags:
+                print(f"    {flag}")
+        return 0
+    print(completion_script(args.shell), end="")
+    return 0
 
 
 def normalize_argv(argv: list[str]) -> list[str]:
     """Keep the original ``bili_audio.py KEYWORD`` syntax working."""
     if not argv:
-        return ["search"]
+        return ["recommend"]
     if argv in (["-h"], ["--help"], ["--version"]):
         return argv
     if argv[0] not in COMMANDS:
@@ -1186,9 +1653,11 @@ def add_playback_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cookies",
-        help="Netscape cookies.txt 路徑，給 yt-dlp/mpv 使用",
+        help="Netscape cookies.txt 路徑，同時供 API 與 yt-dlp/mpv 使用",
     )
     parser.add_argument("--mpv", help="指定 mpv 路徑")
+    parser.add_argument("--audio-device", default="auto",
+                        help="mpv 音訊裝置；用 mpv --audio-device=help 查詢")
     parser.add_argument(
         "--volume",
         type=int,
@@ -1197,31 +1666,66 @@ def add_playback_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--play-mode",
-        choices=("audio", "video"),
-        default="audio",
-        help="Enter／--first 的預設模式，預設 audio",
+        choices=("audio", "video", "window"),
+        default="video",
+        help="Enter／--first 的模式：預設 video 終端影片；audio 音訊、window 滑鼠控制視窗",
     )
     parser.add_argument(
         "--video-output",
         choices=("auto", "tct", "kitty", "sixel"),
+        default="kitty",
+        help="預設 kitty 圖片輸出；auto 自動判斷，tct 為字元方塊備用模式",
+    )
+    parser.add_argument(
+        "--kitty-shm",
+        choices=("auto", "yes", "no"),
         default="auto",
-        help="終端影片輸出；auto 在 Kitty/WezTerm 用 kitty，其餘用 tct",
+        help="kitty 輸出是否用共享記憶體；auto 只在真正的 kitty 開啟，Ghostty 會關閉",
+    )
+    parser.add_argument(
+        "--stealth",
+        action="store_true",
+        help="隱蔽播放：畫面縮到右下角、關掉 OSD 與檔名輸出；mpv 內按 b 可立刻收掉畫面",
+    )
+    parser.add_argument(
+        "--max-height",
+        type=int,
+        default=0,
+        metavar="PX",
+        help="限制來源影像高度（例如 480）；預設 0 不限制，取最高可用串流",
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Bilibili 終端瀏覽器：搜尋、使用者、熱門、排行榜，"
+            "Bilibili 終端瀏覽器：登入、個人推薦、搜尋、熱門、排行榜，"
             "並用 mpv 聽音訊或在 terminal 播放影片。"
         )
     )
-    parser.add_argument("--version", action="version", version="bili-audio 2.0")
+    parser.add_argument("--version", action="version", version="bili-audio 2.1")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("home", help="功能選單（搜尋、熱門、帳號等）")
+    subparsers.add_parser("doctor", help="檢查工具與設定，不顯示 cookies")
+    subparsers.add_parser("logout", help="移除本機儲存的登入，不登出瀏覽器")
+    status = subparsers.add_parser("status", help="驗證目前登入帳號")
+    add_backend_arguments(status)
+    add_output_arguments(status)
+    status.add_argument("--cookies", help="驗證指定 Netscape cookie 檔")
+    login = subparsers.add_parser("login", help="Bilibili App 掃碼登入，或匯入 cookies")
+    add_backend_arguments(login)
+    login_method = login.add_mutually_exclusive_group()
+    login_method.add_argument("--cookies", help="匯入 Netscape cookie 檔")
+    login_method.add_argument("--cookie-stdin", action="store_true", help="從 stdin 讀取 Cookie header")
+    recommend = subparsers.add_parser("recommend", help="開啟推薦，需要時自動登入（預設入口）")
+    add_playback_arguments(recommend)
+    recommend.add_argument("-p", "--page", type=int, default=1)
+    recommend.set_defaults(limit=20)
 
     search = subparsers.add_parser(
         "search",
-        help="搜尋影片（也是向下相容的預設命令）",
+        help="搜尋影片（也支援直接輸入關鍵字）",
     )
     search.add_argument("keyword", nargs="*", help="搜尋關鍵字；留空會詢問")
     search.add_argument(
@@ -1250,6 +1754,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="另外載入 N 部影片供選擇播放",
     )
     add_playback_arguments(user)
+
+    watchlater = subparsers.add_parser("watchlater", help="帳號的稍後再看（唯讀）")
+    add_playback_arguments(watchlater)
+    watchlater.set_defaults(limit=0)
+
+    favorites = subparsers.add_parser("favorites", help="帳號的收藏夾（唯讀）")
+    favorites.add_argument(
+        "--media-id",
+        type=int,
+        default=None,
+        help="直接開啟指定收藏夾；省略時先選收藏夾",
+    )
+    add_playback_arguments(favorites)
+    favorites.set_defaults(limit=0)
+
+    install = subparsers.add_parser(
+        "install", help=f"把自己連結成 {CLI_NAME} 指令並安裝 zsh 補全",
+    )
+    install.add_argument("--prefix", help="安裝到指定前綴的 bin／share，預設家目錄與 Homebrew")
+    install.add_argument("--uninstall", action="store_true", help="移除連結與補全檔")
+
+    completion = subparsers.add_parser(
+        "completion",
+        help="輸出 shell 補全腳本，或用 --list 直接列出可用參數",
+    )
+    completion.add_argument(
+        "shell",
+        nargs="?",
+        choices=("zsh", "bash"),
+        default="zsh",
+        help="要產生哪個 shell 的補全腳本，預設 zsh",
+    )
+    completion.add_argument(
+        "--list",
+        action="store_true",
+        help="改成人看的清單：列出每個子命令與它的參數",
+    )
+
+    history = subparsers.add_parser(
+        "history",
+        help="本機播放紀錄；Enter 會從 mpv 記住的位置繼續",
+    )
+    history.add_argument(
+        "--clear",
+        action="store_true",
+        help="清除本機播放紀錄後結束；不影響登入與續播位置",
+    )
+    add_playback_arguments(history)
+    history.set_defaults(limit=0)
 
     hot = subparsers.add_parser("hot", help="熱門影片")
     hot.add_argument("-p", "--page", type=int, default=1, help="頁碼")
@@ -1288,6 +1841,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--page 必須大於 0")
     if getattr(args, "limit", 0) < 0:
         parser.error("--limit 不可小於 0")
+    if args.command == "recommend" and args.limit > 30:
+        parser.error("recommend 每批最多 30 筆，請用 --page 或 Ctrl-F 換下一批")
     if getattr(args, "videos", 0) < 0:
         parser.error("--videos 不可小於 0")
     volume = getattr(args, "volume", 40)
@@ -1309,6 +1864,91 @@ def videos_from_items(items: list[dict[str, Any]]) -> list[Video]:
         seen.add(key)
         videos.append(video)
     return videos
+
+
+def require_account(session: Session, args: argparse.Namespace, feature: str) -> None:
+    if not session.status(args.timeout, cached=True)["logged_in"]:
+        raise SystemExit(f"{feature}需要有效登入，請先執行 ./bili_audio.py login。")
+    session.ensure_buvid(args.timeout)
+
+
+def watchlater_items(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    """Observed shape: data.list[], with a negative state on videos that no longer play."""
+    data = payload.get("data")
+    entries = data.get("list") if isinstance(data, dict) else None
+    if entries is None and isinstance(data, dict):
+        entries = []
+    if not isinstance(entries, list):
+        raise SystemExit("稍後再看 API 格式已變更，請更新程式。")
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("bvid"):
+            skipped += 1
+            continue
+        state = entry.get("state")
+        if isinstance(state, int) and state < 0:
+            skipped += 1
+            continue
+        items.append(entry)
+    return items, skipped
+
+
+def favorite_folders(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    data = payload.get("data")
+    folders = data.get("list") if isinstance(data, dict) else None
+    if folders is None:
+        return []
+    if not isinstance(folders, list):
+        raise SystemExit("收藏夾 API 格式已變更，請更新程式。")
+    clean = []
+    for folder in folders:
+        if not isinstance(folder, dict) or not isinstance(folder.get("id"), int):
+            continue
+        clean.append({
+            "id": folder["id"],
+            "title": clean_text(folder.get("title")) or str(folder["id"]),
+            "media_count": folder.get("media_count") or 0,
+        })
+    return clean
+
+
+def favorite_media_items(
+    payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int, bool]:
+    """Reshapes data.medias[] into the keys make_video already understands."""
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise SystemExit("收藏夾 API 格式已變更，請更新程式。")
+    medias = data.get("medias")
+    if medias is None:
+        medias = []  # An empty folder answers with null rather than [].
+    if not isinstance(medias, list):
+        raise SystemExit("收藏夾 API 格式已變更，請更新程式。")
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    for media in medias:
+        if not isinstance(media, dict):
+            skipped += 1
+            continue
+        # type 2 is a normal UGC video; attr was 0 on every readable entry observed,
+        # so anything non-zero is treated as not playable rather than guessed at.
+        if media.get("type") != 2 or not media.get("bvid") or media.get("attr"):
+            skipped += 1
+            continue
+        counts = media.get("cnt_info") if isinstance(media.get("cnt_info"), dict) else {}
+        items.append({
+            **media,
+            "pubdate": media.get("pubtime"),
+            "desc": media.get("intro"),
+            "stat": {"view": counts.get("play")},
+        })
+    return items, skipped, bool(data.get("has_more"))
+
+
+def report_skipped(skipped: int, args: argparse.Namespace) -> None:
+    if skipped and not args.json:
+        eprint(f"已略過 {skipped} 筆失效或非影片項目。")
 
 
 def finish_video_action(
@@ -1436,6 +2076,24 @@ def run_user(args: argparse.Namespace, source: BiliSource) -> int:
     return finish_video_action(args, videos, f"{user.name} 的影片")
 
 
+def run_history(args: argparse.Namespace) -> int:
+    if args.clear:
+        clear_history()
+        print("已清除本機播放紀錄；登入與 mpv 續播位置不受影響。")
+        return 0
+    entries = load_history()
+    if args.limit:
+        entries = entries[: args.limit]
+    videos = videos_from_history(entries)
+    if args.json:
+        print_json(videos)
+        return 0
+    if not videos:
+        eprint("還沒有本機播放紀錄；播放任何一部影片後就會出現在這裡。")
+        return 1
+    return finish_video_action(args, videos, "本機播放紀錄（新的在最前，Enter 從上次位置繼續）")
+
+
 def run_hot(args: argparse.Namespace, source: BiliSource) -> int:
     count = UNLIMITED_PAGE_COUNT if args.limit == 0 else args.limit
     videos = videos_from_items(source.hot(args.page, count))
@@ -1454,10 +2112,314 @@ def run_rank(args: argparse.Namespace, source: BiliSource) -> int:
     return finish_video_action(args, videos, "全站即時榜")
 
 
+def run_login(args: argparse.Namespace) -> int:
+    with Session(DEFAULT_USER_AGENT, args.cookies, empty=not args.cookies) as session:
+        if args.cookie_stdin:
+            if sys.stdin.isatty():
+                import getpass
+                session.load_header(getpass.getpass("貼上 Cookie header（不會顯示）："))
+            else:
+                session.load_header(sys.stdin.read(65537).rstrip("\r\n"))
+        elif not args.cookies:
+            login_qr(session, args.timeout, eprint)
+        status = session.status(args.timeout)
+        if not status["logged_in"]:
+            raise SystemExit("登入憑證無效或已過期；原本儲存的帳號未變更。")
+        session.save()
+        print(f"已登入：{clean_text(status['name'])}（UID: {status['uid']}）")
+        print("執行 ./bili_audio.py recommend 查看個人推薦。")
+        if env_cookie():
+            eprint("注意：環境變數 Cookie 仍會優先於儲存的登入；切換帳號前請 unset BILIBILI_COOKIE BILI_COOKIE。")
+    return 0
+
+
+def ensure_recommend_login(args: argparse.Namespace, session: Session, *, expired: bool = False) -> dict:
+    status = {"logged_in": False} if expired else session.status(args.timeout, cached=True)
+    if not status["logged_in"]:
+        if args.json or args.first or args.print_url or args.direct_url or not terminal_is_interactive():
+            raise SystemExit("個人推薦需要有效登入，請先執行 ./bili_audio.py login。")
+        if session.source in ("file", "environment"):
+            raise SystemExit("指定的 Cookie 已失效；請更新 --cookies／環境變數，或移除設定後重新開啟。")
+        require_command("fzf", "brew install fzf")
+        eprint("尚未登入或登入已過期，掃碼一次即可繼續。")
+        # Keep the previous saved account until the replacement is verified.
+        with Session(session.user_agent, empty=True) as fresh:
+            login_qr(fresh, args.timeout, eprint)
+            status = fresh.status(args.timeout)
+            if not status["logged_in"]:
+                raise SystemExit("登入驗證未通過，請重新開啟。")
+            fresh.adopt_buvid(session)
+            fresh.save()
+            session.jar.clear()
+            session.load_file(session_path())
+            session.source = "saved"
+            session.flush()
+            session.adopt_wbi(fresh)
+        eprint(f"已登入：{clean_text(status['name'])}，正在載入推薦。")
+    if not args.cookies_from_browser:
+        args.cookies = session.path
+    return status
+
+
+class RecommendationLoginExpired(Exception):
+    """Restart the recommendation list after renewing an expired account."""
+
+
+def run_recommend(args: argparse.Namespace, session: Session) -> int:
+    status = ensure_recommend_login(args, session)
+
+    next_batch = args.page
+
+    def load_page(page: int) -> list[Video]:
+        nonlocal next_batch
+        if not session.status(args.timeout, cached=True)["logged_in"]:
+            session.invalidate()
+            raise RecommendationLoginExpired
+        batch = max(next_batch, args.page + page - 1)
+        session.ensure_buvid(args.timeout)
+        query = session.wbi_query({
+            "fresh_idx": batch, "fresh_idx_1h": batch, "fresh_type": 4,
+            "feed_version": "V8", "homepage_ver": 1, "web_location": 1430650,
+            "brush": 0, "y_num": 5, "ps": args.limit or 30,
+        }, args.timeout)
+        pace_api_calls()
+        payload = session.request(RECOMMEND_API_URL + "?" + query, args.timeout)
+        if payload.get("code") == -101:
+            session.invalidate()
+            raise RecommendationLoginExpired
+        require_api_success(payload)
+        next_batch = batch + 1
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("item"), list):
+            raise SystemExit("Bilibili 推薦 API 格式已變更，請更新程式。")
+        items = []
+        for item in data["item"]:
+            if not isinstance(item, dict) or item.get("goto") != "av":
+                continue
+            bvid = item.get("bvid")
+            if not isinstance(bvid, str) or not re.fullmatch(r"BV[0-9A-Za-z]{10}", bvid):
+                continue
+            # Ignore promotional/external URLs in recommendation cards.
+            reason = item.get("rcmd_reason")
+            description = reason.get("content", "") if isinstance(reason, dict) else reason
+            items.append({**item, "url": f"https://www.bilibili.com/video/{bvid}",
+                          "description": item.get("description") or description or ""})
+        videos = videos_from_items(items)
+        return videos[:args.limit] if args.limit else videos
+
+    videos = load_page(1)
+    title = f"{clean_text(status['name'])} 的推薦"
+    if args.json or args.first or args.print_url or args.direct_url or not videos:
+        return finish_video_action(args, videos, title)
+    return interactive_playback(args, [videos], title, page_loader=load_page)
+
+
+def run_watchlater(args: argparse.Namespace, session: Session) -> int:
+    require_account(session, args, "稍後再看")
+    pace_api_calls()
+    payload = session.request(WATCHLATER_API_URL, args.timeout)
+    require_api_success(payload)
+    items, skipped = watchlater_items(payload)
+    report_skipped(skipped, args)
+    videos = videos_from_items(items)
+    if args.limit:
+        videos = videos[: args.limit]
+    if args.json:
+        print_json(videos)
+        return 0
+    if not videos:
+        eprint("稍後再看是空的。")
+        return 1
+    return finish_video_action(args, videos, "稍後再看")
+
+
+def choose_favorite_folder(folders: list[dict[str, Any]]) -> dict[str, Any] | None:
+    require_command("fzf", "brew install fzf")
+    rows = [f"{folder['id']}\t{folder['title']}（{folder['media_count']} 部）"
+            for folder in folders]
+    result = subprocess.run(
+        ["fzf", "--delimiter=\t", "--with-nth=2", "--layout=reverse",
+         "--height=60%", "--border", "--prompt=收藏夾> ",
+         "--header=Enter 開啟 / Esc 離開"],
+        input="\n".join(rows) + "\n", text=True, stdout=subprocess.PIPE, check=False,
+    )
+    if result.returncode not in (0, 1, 130, -signal.SIGINT):
+        raise SystemExit(f"fzf 無法開啟收藏夾清單（exit {result.returncode}）。")
+    if result.returncode or not result.stdout.strip():
+        return None
+    chosen = result.stdout.split("\t", 1)[0].strip()
+    for folder in folders:
+        if str(folder["id"]) == chosen:
+            return folder
+    raise SystemExit("收藏夾選項無效。")
+
+
+def run_favorites(args: argparse.Namespace, session: Session) -> int:
+    require_account(session, args, "收藏夾")
+    media_id = args.media_id
+
+    if media_id is None:
+        status = session.status(args.timeout, cached=True)
+        pace_api_calls()
+        payload = session.request(
+            f"{FAV_FOLDERS_API_URL}?up_mid={status['uid']}", args.timeout
+        )
+        require_api_success(payload)
+        folders = favorite_folders(payload)
+        if not folders:
+            eprint("這個帳號沒有自建收藏夾。")
+            return 1
+        if args.json:
+            print(json.dumps(folders, ensure_ascii=False, indent=2))
+            return 0
+        chosen = choose_favorite_folder(folders)
+        if not chosen:
+            return 0
+        media_id = chosen["id"]
+        title = f"收藏夾：{chosen['title']}"
+    else:
+        title = f"收藏夾 {media_id}"
+
+    more = {"has_more": True}
+
+    def load_page(page: int) -> list[Video]:
+        if page > 1 and not more["has_more"]:
+            return []
+        pace_api_calls()
+        payload = session.request(
+            f"{FAV_RESOURCE_API_URL}?media_id={media_id}"
+            f"&pn={page}&ps={FAV_PAGE_SIZE}&platform=web",
+            args.timeout,
+        )
+        require_api_success(payload)
+        items, skipped, has_more = favorite_media_items(payload)
+        more["has_more"] = has_more
+        report_skipped(skipped, args)
+        return videos_from_items(items)
+
+    videos = load_page(1)
+    if args.limit:
+        videos = videos[: args.limit]
+    if args.json:
+        print_json(videos)
+        return 0
+    if not videos:
+        eprint("這個收藏夾沒有可播放的影片。")
+        return 1
+    return interactive_playback(args, [videos], title, page_loader=load_page)
+
+
+def run_doctor() -> int:
+    missing = []
+    print(f"Python：{sys.version.split()[0]}")
+    for command in ("fzf", "mpv", "yt-dlp", "curl", "qrencode"):
+        path = shutil.which(command)
+        optional = "（QR 登入需要）" if command == "qrencode" else ""
+        print(f"{command}{optional}：{path or '未安裝'}")
+        if not path and command in ("fzf", "mpv", "yt-dlp"):
+            missing.append(command)
+    print(f"本機登入：{'已儲存，使用 status 驗證' if session_path().exists() else '尚未儲存'}")
+    print(f"環境變數 Cookie：{'已設定（優先於本機登入）' if env_cookie() else '未設定'}")
+    if missing:
+        print("安裝缺少的工具：brew install " + " ".join(missing))
+    return 1 if missing else 0
+
+
+def run_home() -> int:
+    require_command("fzf", "brew install fzf")
+    if not terminal_is_interactive():
+        raise SystemExit("互動首頁需要 TTY；腳本請使用 search／recommend --json 等明確命令。")
+    choices = [
+        "recommend\t個人推薦", "search\t搜尋影片", "hot\t熱門影片",
+        "rank\t全站排行榜", "watchlater\t稍後再看", "favorites\t收藏夾",
+        "login\t登入／切換帳號", "status\t驗證登入狀態",
+        "logout\t移除本機登入", "doctor\t檢查環境",
+    ]
+    while True:
+        result = subprocess.run(
+            ["fzf", "--delimiter=\t", "--with-nth=2", "--layout=reverse",
+             "--height=60%", "--border", "--prompt=bili-audio> ",
+             "--header=Enter 開啟 / Esc 離開"],
+            input="\n".join(choices) + "\n", text=True, stdout=subprocess.PIPE, check=False,
+        )
+        if result.returncode not in (0, 1, 130, -signal.SIGINT):
+            raise SystemExit(f"fzf 無法開啟首頁（exit {result.returncode}），請確認 terminal 可用。")
+        if result.returncode or not result.stdout.strip():
+            return 0
+        command = result.stdout.split("\t", 1)[0].strip()
+        if command not in COMMANDS or command == "home":
+            raise SystemExit("首頁選項無效。")
+        try:
+            main([command])
+        except KeyboardInterrupt:
+            eprint("已中斷操作，返回首頁。")
+        except SystemExit as exc:
+            eprint(clean_text(exc))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.command == "completion":
+        return run_completion(args)
+    if args.command == "install":
+        return run_install(args)
+    if args.command == "home":
+        return run_home()
+    if args.command == "doctor":
+        return run_doctor()
+    if args.command == "login":
+        return run_login(args)
+    if args.command == "logout":
+        try:
+            session_path().unlink(missing_ok=True)
+        except OSError as exc:
+            raise SystemExit("無法移除本機登入，請確認設定目錄權限。") from exc
+        print("已移除本機登入；不影響瀏覽器或其他裝置。")
+        if env_cookie():
+            eprint("環境變數 Cookie 仍有效；請 unset BILIBILI_COOKIE BILI_COOKIE。")
+        return 0
+
+    global _AUTH_SESSION
+    with Session(os.environ.get("BILI_USER_AGENT", DEFAULT_USER_AGENT), getattr(args, "cookies", None)) as session:
+        previous = _AUTH_SESSION
+        _AUTH_SESSION = session if session.source != "none" else None
+        try:
+            if args.command == "status":
+                status = session.status(args.timeout)
+                status["name"] = clean_text(status.get("name", ""))
+                if args.json:
+                    print(json.dumps(status, ensure_ascii=False, indent=2))
+                else:
+                    print(f"已登入：{status['name']}（UID: {status['uid']}，來源: {status['source']}）"
+                          if status["logged_in"] else "尚未登入或登入已過期，請執行 login。")
+                return 0 if status["logged_in"] else 1
+            if hasattr(args, "cookies") and not args.cookies_from_browser and session.has_login:
+                args.cookies = session.path
+            if args.command == "watchlater":
+                return run_watchlater(args, session)
+            if args.command == "favorites":
+                return run_favorites(args, session)
+            if args.command == "recommend":
+                for attempt in range(2):
+                    try:
+                        return run_recommend(args, session)
+                    except RecommendationLoginExpired:
+                        if attempt:
+                            raise SystemExit("重新登入後仍被拒絕，請稍後重試。") from None
+                        ensure_recommend_login(args, session, expired=True)
+            # Use this account consistently instead of an unrelated optional CLI session.
+            if session.source != "none" and args.backend == "auto":
+                args.backend = "direct"
+            return dispatch_public(args)
+        finally:
+            _AUTH_SESSION = previous
+
+
+def dispatch_public(args: argparse.Namespace) -> int:
     source = BiliSource(args)
 
+    if args.command == "history":
+        return run_history(args)
     if args.command == "backend-info":
         if source.upstream:
             print(f"bilibili-cli: {source.upstream.executable}")

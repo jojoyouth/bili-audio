@@ -2,3 +2,11 @@ __pycache__/
 *.py[cod]
 .venv/
 .ruff_cache/
+cookies.txt
+cookies-*.txt
+.cookies-*
+.DS_Store
+# 內部工作筆記，不公開
+AGENTS.md
+NEXT_SESSION.md
+state.md

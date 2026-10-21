@@ -4,7 +4,11 @@ import argparse
 import contextlib
 import io
 import json
+import os
+import pathlib
+import stat
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -196,15 +200,107 @@ class PlayerTests(unittest.TestCase):
         self.assertIn("--referrer=https://www.bilibili.com/", command)
         self.assertNotIn("--vo=tct", command)
 
+    def test_defaults_and_playback_feedback(self):
+        args = bili_audio.parse_args([])
+        self.assertEqual(args.play_mode, "video")
+        self.assertEqual(args.video_output, "kitty")
+        command = bili_audio.build_mpv_command(self.video, self.args, "video")
+        self.assertIn("--osd-duration=2000", command)
+        self.assertTrue(any(arg.startswith("--input-conf=") for arg in command))
+        overlay = next(arg for arg in command if arg.startswith("--osd-msg1="))
+        self.assertIn("${?mute==yes:靜音}", overlay)
+        self.assertIn("${?pause==no:播放中}", overlay)
+        self.assertEqual(bili_audio.parse_args(["recommend", "--play-mode", "audio"]).play_mode, "audio")
+
     def test_video_command_uses_terminal_vo(self) -> None:
         command = bili_audio.build_mpv_command(self.video, self.args, "video")
         self.assertIn("--no-config", command)
         self.assertIn("--vo=tct", command)
         self.assertIn("--profile=sw-fast", command)
-        self.assertIn("--really-quiet", command)
+        self.assertNotIn("--really-quiet", command)
+        self.assertIn("--msg-level=all=info,osd/libass=fatal", command)
+        self.assertIn("--osd-level=1", command)
+        self.assertIn("--osc=no", command)
+        self.assertIn("--ytdl-format=bestvideo+bestaudio/best", command)
+        self.assertIn("--network-timeout=20", command)
+        self.assertIn("--ytdl-raw-options-append=socket-timeout=20", command)
         self.assertIn("--term-status-msg=", command)
         self.assertIn("--vo-tct-buffering=frame", command)
         self.assertNotIn("--no-video", command)
+
+    def test_kitty_output_uses_shared_memory(self) -> None:
+        # base64 frames cost ~230 KB each on the PTY, which caps playback well under
+        # 60 fps — but only kitty itself can read the shared-memory alternative.
+        with mock.patch.dict(os.environ,
+                             {"TERM": "xterm-kitty", "KITTY_WINDOW_ID": "1",
+                              "PATH": os.environ.get("PATH", "")}, clear=True):
+            command = bili_audio.build_mpv_command(
+                self.video, self.args, "video", resolved_video_output="kitty"
+            )
+        self.assertIn("--vo=kitty", command)
+        self.assertIn("--vo-kitty-use-shm=yes", command)
+        self.assertNotIn("--vo-tct-buffering=frame", command)
+
+    def test_shm_only_where_the_terminal_reads_it(self) -> None:
+        # Ghostty speaks the kitty graphics protocol but ignores shm, so turning
+        # it on there blanks the picture entirely.
+        cases = {
+            "no": [{"TERM_PROGRAM": "ghostty", "TERM": "xterm-ghostty"},
+                   {"TERM": "xterm-256color"},
+                   {"TERM": "xterm-kitty", "KITTY_WINDOW_ID": "1", "TMUX": "/tmp/s"}],
+            "yes": [{"TERM": "xterm-kitty", "KITTY_WINDOW_ID": "1"},
+                    {"TERM_PROGRAM": "kitty"}],
+        }
+        for expected, environments in cases.items():
+            for environment in environments:
+                with mock.patch.dict(os.environ, {**environment,
+                                                  "PATH": os.environ.get("PATH", "")},
+                                     clear=True):
+                    command = bili_audio.build_mpv_command(
+                        self.video, self.args, "video", resolved_video_output="kitty"
+                    )
+                self.assertIn(f"--vo-kitty-use-shm={expected}", command,
+                              f"{environment} 應該是 {expected}")
+
+    def test_kitty_shm_can_be_forced(self) -> None:
+        self.args.kitty_shm = "yes"
+        with mock.patch.dict(os.environ, {"TERM_PROGRAM": "ghostty",
+                                          "PATH": os.environ.get("PATH", "")}, clear=True):
+            command = bili_audio.build_mpv_command(
+                self.video, self.args, "video", resolved_video_output="kitty"
+            )
+        self.assertIn("--vo-kitty-use-shm=yes", command)
+
+    def test_libass_probe_errors_are_silenced(self) -> None:
+        command = bili_audio.build_mpv_command(self.video, self.args, "video")
+        self.assertIn("--msg-level=all=info,osd/libass=fatal", command)
+
+    def test_max_height_is_opt_in(self) -> None:
+        command = bili_audio.build_mpv_command(self.video, self.args, "video")
+        self.assertIn("--ytdl-format=bestvideo+bestaudio/best", command)
+        self.args.max_height = 480
+        command = bili_audio.build_mpv_command(self.video, self.args, "video")
+        self.assertIn("--ytdl-format=bestvideo[height<=?480]+bestaudio/best", command)
+
+    def test_stealth_hides_osd_and_shrinks_the_picture(self) -> None:
+        self.args.stealth = True
+        with mock.patch.object(bili_audio, "terminal_cells", return_value=(120, 40)):
+            command = bili_audio.build_mpv_command(
+                self.video, self.args, "video", resolved_video_output="kitty"
+            )
+        self.assertIn("--osd-level=0", command)
+        self.assertIn("--term-playing-msg=", command)
+        self.assertIn("--term-title=", command)
+        self.assertNotIn("--osd-level=1", command)
+        self.assertFalse([item for item in command if item.startswith("--osd-msg1=")])
+        self.assertTrue([item for item in command if item.startswith("--vo-kitty-cols=")])
+        self.assertTrue([item for item in command if item.startswith("--vo-kitty-left=")])
+
+    def test_stealth_leaves_audio_mode_untouched(self) -> None:
+        self.args.stealth = True
+        command = bili_audio.build_mpv_command(self.video, self.args, "audio")
+        self.assertIn("--no-video", command)
+        self.assertNotIn("--osd-level=0", command)
 
     def test_cookie_path_with_comma_uses_append_option(self) -> None:
         self.args.cookies = "/tmp/bili,cookies.txt"
@@ -223,6 +319,16 @@ class PlayerTests(unittest.TestCase):
             any(item.startswith("--ytdl-raw-options=") for item in command)
         )
 
+    def test_window_mode_has_mouse_controls_and_selected_audio(self):
+        self.args.audio_device = "coreaudio/BuiltInSpeakerDevice"
+        command = bili_audio.build_mpv_command(self.video, self.args, "window")
+        self.assertIn("--force-window=yes", command)
+        self.assertIn("--osc=yes", command)
+        self.assertIn("--mute=no", command)
+        self.assertIn("--aid=auto", command)
+        self.assertIn("--audio-device=coreaudio/BuiltInSpeakerDevice", command)
+        self.assertFalse(any(arg.startswith("--vo=") for arg in command))
+
     def test_invalid_explicit_mpv_has_actionable_error(self) -> None:
         self.args.mpv = "/definitely/missing/bili-audio-mpv"
 
@@ -240,6 +346,14 @@ class PlayerTests(unittest.TestCase):
     def test_auto_falls_back_to_true_color_blocks(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertEqual(bili_audio.terminal_video_output("auto"), "tct")
+
+    def test_auto_uses_tct_for_other_graphics_terminals(self) -> None:
+        for program in ("ghostty", "WezTerm"):
+            with self.subTest(program=program), mock.patch.dict(
+                "os.environ", {"TERM_PROGRAM": program, "TERM": "xterm-256color"}, clear=True
+            ):
+                self.assertEqual(bili_audio.terminal_video_output("auto"), "tct")
+                self.assertEqual(bili_audio.terminal_video_output("kitty"), "kitty")
 
     def test_auto_avoids_kitty_inside_tmux(self) -> None:
         with mock.patch.dict(
@@ -624,6 +738,239 @@ class CommandLimitTests(unittest.TestCase):
 
         self.assertEqual(returncode, 0)
         self.assertEqual(len(json.loads(output.getvalue())["videos"]), 2)
+
+
+class HistoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        # clear=True would drop PATH, and build_mpv_command has to find mpv.
+        environment = mock.patch.dict(
+            os.environ,
+            {"BILI_AUDIO_CONFIG_DIR": self.directory.name,
+             "PATH": os.environ.get("PATH", "")},
+            clear=True,
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        bili_audio._history_warned = False
+
+    @staticmethod
+    def video(bvid: str, title: str = "標題") -> bili_audio.Video:
+        return bili_audio.Video(
+            title=title, author="UP", bvid=bvid, aid="",
+            url=f"https://www.bilibili.com/video/{bvid}",
+            duration="1:00", play=1, pubdate=None, description="",
+        )
+
+    def test_replay_moves_to_the_front_without_duplicating(self) -> None:
+        bili_audio.record_history(self.video("BV1111111111", "第一"))
+        bili_audio.record_history(self.video("BV2222222222", "第二"))
+        bili_audio.record_history(self.video("BV1111111111", "第一重播"))
+        entries = bili_audio.load_history()
+        self.assertEqual([entry["bvid"] for entry in entries],
+                         ["BV1111111111", "BV2222222222"])
+        self.assertEqual(entries[0]["title"], "第一重播")
+
+    def test_history_is_capped_and_private(self) -> None:
+        for index in range(bili_audio.HISTORY_LIMIT + 30):
+            bili_audio.record_history(self.video(f"BV{index:010d}"))
+        self.assertEqual(len(bili_audio.load_history()), bili_audio.HISTORY_LIMIT)
+        mode = stat.S_IMODE(os.stat(bili_audio.history_path()).st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_damaged_file_warns_once_and_still_accepts_writes(self) -> None:
+        bili_audio.history_path().parent.mkdir(parents=True, exist_ok=True)
+        bili_audio.history_path().write_text("not json at all", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(bili_audio.load_history(), [])
+            bili_audio.load_history()
+        self.assertEqual(errors.getvalue().count("格式不正確"), 1)
+        bili_audio.record_history(self.video("BV3333333333"))
+        self.assertEqual([e["bvid"] for e in bili_audio.load_history()],
+                         ["BV3333333333"])
+
+    def test_entries_without_a_real_bvid_are_dropped(self) -> None:
+        bili_audio.record_history(self.video("not-a-bvid"))
+        bili_audio.record_history(self.video(""))
+        self.assertEqual(bili_audio.load_history(), [])
+        bili_audio.write_history([{"bvid": "../escape", "title": "x"}])
+        self.assertEqual(bili_audio.load_history(), [])
+
+    def test_clear_empties_the_list(self) -> None:
+        bili_audio.record_history(self.video("BV1111111111"))
+        bili_audio.clear_history()
+        self.assertEqual(bili_audio.load_history(), [])
+        self.assertFalse(bili_audio.history_path().exists())
+
+    def test_history_survives_a_reload(self) -> None:
+        bili_audio.record_history(self.video("BV1111111111", "留下來"))
+        reloaded = bili_audio.videos_from_history(bili_audio.load_history())
+        self.assertEqual(reloaded[0].title, "留下來")
+        self.assertEqual(reloaded[0].url,
+                         "https://www.bilibili.com/video/BV1111111111")
+
+    def test_playback_records_before_starting_mpv(self) -> None:
+        args = bili_audio.parse_args(["hot"])
+        with mock.patch("bili_audio.play_audio", return_value=0) as player:
+            bili_audio.play_selected(self.video("BV1111111111"), args,
+                                     bili_audio.FZF_PLAY_AUDIO)
+        player.assert_called_once()
+        self.assertEqual(len(bili_audio.load_history()), 1)
+
+    def test_mpv_resumes_through_its_own_watch_later(self) -> None:
+        args = bili_audio.parse_args(["hot"])
+        for mode in ("audio", "video", "window"):
+            command = bili_audio.build_mpv_command(
+                self.video("BV1111111111"), args, mode,
+                resolved_video_output="tct" if mode == "video" else None,
+            )
+            self.assertIn("--save-position-on-quit=yes", command)
+            self.assertIn(f"--watch-later-directory={bili_audio.watch_later_dir()}",
+                          command)
+
+
+class WatchlaterFavoriteTests(unittest.TestCase):
+    """Shapes here mirror what the live API actually returned."""
+
+    def test_watchlater_drops_unplayable_and_keeps_order(self) -> None:
+        payload = {"code": 0, "data": {"count": 3, "list": [
+            {"bvid": "BV1111111111", "title": "可播", "duration": 346,
+             "owner": {"name": "UP"}, "stat": {"view": 10}, "pubdate": 1,
+             "desc": "簡介", "state": 0, "progress": 20},
+            {"bvid": "BV2222222222", "title": "已下架", "state": -10},
+            {"title": "沒有 bvid", "state": 0},
+        ]}}
+        items, skipped = bili_audio.watchlater_items(payload)
+        self.assertEqual(skipped, 2)
+        videos = bili_audio.videos_from_items(items)
+        self.assertEqual([video.bvid for video in videos], ["BV1111111111"])
+        self.assertEqual(videos[0].duration, "05:46")
+        self.assertEqual(videos[0].author, "UP")
+
+    def test_watchlater_accepts_an_empty_list(self) -> None:
+        self.assertEqual(bili_audio.watchlater_items({"data": {"list": None}}), ([], 0))
+        with self.assertRaisesRegex(SystemExit, "格式已變更"):
+            bili_audio.watchlater_items({"data": "nonsense"})
+
+    def test_favorite_media_is_reshaped_for_make_video(self) -> None:
+        payload = {"code": 0, "data": {"has_more": True, "medias": [
+            {"bvid": "BV1111111111", "type": 2, "title": "影片", "intro": "簡介",
+             "duration": 130, "upper": {"name": "UP"}, "attr": 0,
+             "cnt_info": {"play": 999}, "pubtime": 1700000000},
+            {"bvid": "BV2222222222", "type": 2, "title": "已失效", "attr": 9},
+            {"bvid": "BV3333333333", "type": 24, "title": "合集", "attr": 0},
+        ]}}
+        items, skipped, has_more = bili_audio.favorite_media_items(payload)
+        self.assertEqual((skipped, has_more), (2, True))
+        videos = bili_audio.videos_from_items(items)
+        self.assertEqual([video.bvid for video in videos], ["BV1111111111"])
+        self.assertEqual(videos[0].play, 999)
+        self.assertEqual(videos[0].duration, "02:10")
+        self.assertEqual(videos[0].description, "簡介")
+        self.assertEqual(videos[0].pubdate, 1700000000)
+
+    def test_empty_folder_answers_with_null_medias(self) -> None:
+        items, skipped, has_more = bili_audio.favorite_media_items(
+            {"data": {"medias": None, "has_more": False}}
+        )
+        self.assertEqual((items, skipped, has_more), ([], 0, False))
+
+    def test_folder_list_keeps_only_usable_entries(self) -> None:
+        folders = bili_audio.favorite_folders({"data": {"list": [
+            {"id": 1, "title": "默认收藏夹", "media_count": 39},
+            {"id": 2, "title": "", "media_count": 0},
+            {"title": "沒有 id"},
+        ]}})
+        self.assertEqual(folders, [
+            {"id": 1, "title": "默认收藏夹", "media_count": 39},
+            {"id": 2, "title": "2", "media_count": 0},
+        ])
+        self.assertEqual(bili_audio.favorite_folders({"data": {"list": None}}), [])
+
+    def test_both_commands_refuse_without_a_login(self) -> None:
+        session = mock.Mock()
+        session.status.return_value = {"logged_in": False}
+        for command, runner in (
+            (["watchlater"], bili_audio.run_watchlater),
+            (["favorites"], bili_audio.run_favorites),
+        ):
+            with self.assertRaisesRegex(SystemExit, "需要有效登入"):
+                runner(bili_audio.parse_args(command), session)
+        session.request.assert_not_called()
+
+
+class CompletionTests(unittest.TestCase):
+    def test_commands_match_parser(self) -> None:
+        # A new subparser that is missing from COMMANDS gets treated as a
+        # search keyword instead of a command, which is silent and confusing.
+        parser_names = set(bili_audio.parser_subcommands(bili_audio.build_parser()))
+        self.assertEqual(parser_names, bili_audio.COMMANDS)
+
+    def test_table_is_read_off_the_parser(self) -> None:
+        table = dict(bili_audio.completion_table())
+        self.assertIn("history", table)
+        self.assertIn("--clear", table["history"])
+        self.assertIn("--stealth", table["recommend"])
+        self.assertIn("--max-height", table["hot"])
+
+    def test_scripts_name_every_command(self) -> None:
+        for shell in ("zsh", "bash"):
+            script = bili_audio.completion_script(shell)
+            for name in bili_audio.COMMANDS:
+                self.assertIn(name, script, f"{shell} 腳本缺少 {name}")
+
+    def test_list_prints_commands_and_flags(self) -> None:
+        args = bili_audio.parse_args(["completion", "--list"])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(bili_audio.run_completion(args), 0)
+        printed = output.getvalue()
+        self.assertIn("history", printed)
+        self.assertIn("    --clear", printed)
+
+    def test_install_links_the_command_and_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as prefix:
+            args = bili_audio.parse_args(["install", "--prefix", prefix])
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(bili_audio.run_install(args), 0)
+            link, completion = bili_audio.install_paths(prefix)
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(), pathlib.Path(bili_audio.__file__).resolve())
+            text = completion.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("#compdef bili-audio"))
+            self.assertIn("history", text)
+
+            # Running it twice must not fail on the existing symlink.
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(bili_audio.run_install(args), 0)
+
+            remove = bili_audio.parse_args(
+                ["install", "--prefix", prefix, "--uninstall"]
+            )
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(bili_audio.run_install(remove), 0)
+            self.assertFalse(link.exists())
+            self.assertFalse(completion.exists())
+
+    def test_autoload_and_sourced_scripts_differ(self) -> None:
+        autoload = bili_audio.completion_script("zsh", autoload=True)
+        sourced = bili_audio.completion_script("zsh")
+        self.assertTrue(autoload.startswith("#compdef"))
+        self.assertNotIn("compdef _bili_audio_complete", autoload)
+        self.assertIn("compdef _bili_audio_complete", sourced)
+        for script in (autoload, sourced):
+            self.assertIn("watchlater", script)
+
+    def test_help_text_matches_the_offered_keys(self) -> None:
+        full = bili_audio.fzf_help_text(paging=True, playback_keys=True, refresh=True)
+        self.assertIn("Ctrl-R", full)
+        self.assertIn("Tab", full)
+        plain = bili_audio.fzf_help_text(paging=False, playback_keys=False, refresh=False)
+        self.assertNotIn("Ctrl-R", plain)
+        self.assertNotIn("Tab 多選", plain)
 
 
 if __name__ == "__main__":
