@@ -46,6 +46,10 @@ UNLIMITED_PAGE_COUNT = 100
 MIN_API_INTERVAL = 0.8
 _last_api_call = 0.0
 HISTORY_LIMIT = 200
+# Rows of text the picture should be as tall as. Expressed in rows rather than
+# pixels so it looks the same on a Retina panel, where one cell is twice as many
+# pixels, and stays put when the window is resized.
+STEALTH_HEIGHT_ROWS = 14
 _history_warned = False
 OSC_SEQUENCE_RE = re.compile(
     r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|$)",
@@ -1148,19 +1152,64 @@ def terminal_ytdl_format(args: argparse.Namespace) -> str:
     return f"bestvideo[height<=?{max_height}]+bestaudio/best"
 
 
-def stealth_kitty_placement() -> list[str]:
-    """A quarter-size picture parked in the bottom-right corner."""
-    cells = terminal_cells()
-    if not cells:
-        return ["--vo-kitty-cols=24", "--vo-kitty-rows=10"]
-    cols, rows = cells
-    width = max(16, cols // 4)
-    height = max(6, rows // 4)
+def terminal_metrics() -> tuple[int, int, int, int] | None:
+    """Columns, rows and the pixel size of one cell."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            packed = fcntl.ioctl(stream.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+        except (OSError, ValueError, AttributeError):
+            continue
+        rows, cols, xpixel, ypixel = struct.unpack("HHHH", packed)
+        if not cols or not rows:
+            continue
+        cell_w = xpixel // cols if xpixel else 8
+        cell_h = ypixel // rows if ypixel else 17
+        return cols, rows, max(1, cell_w), max(1, cell_h)
+    return None
+
+
+def stealth_kitty_placement(wanted_rows: int = STEALTH_HEIGHT_ROWS) -> list[str]:
+    """Park a fixed-size picture against the bottom-right corner.
+
+    The height is absolute so resizing the window does not resize the picture;
+    it only shrinks when the window is too small to hold it. mpv keeps the
+    aspect ratio itself and never sends the kitty c/r keys, so a cell box would
+    not constrain it: give it a pixel height and reserve room for the widest
+    shape it can come back with (16:9).
+    """
+    metrics = terminal_metrics()
+    if not metrics:
+        return [f"--vo-kitty-height={wanted_rows * 17}"]
+    cols, rows, cell_w, cell_h = metrics
+
+    # mpv positions with ESC[top;leftf, which is 1-based, and transmits with C=1
+    # on the alternate screen so the cursor never moves and nothing scrolls.
+    # One spare row absorbs the rounding in cell_h; the right edge needs none.
+    margin_rows, margin_cols = 1, 0
+
+    height_px = wanted_rows * cell_h
+    for _ in range(64):
+        used_rows = -(-height_px // cell_h)
+        used_cols = -(-(height_px * 16 // 9) // cell_w)
+        if used_rows + margin_rows <= rows and used_cols + margin_cols <= cols:
+            break
+        height_px -= cell_h
+        if height_px < cell_h * 2:
+            height_px = cell_h * 2
+            used_rows = -(-height_px // cell_h)
+            used_cols = -(-(height_px * 16 // 9) // cell_w)
+            break
+    left = max(1, cols - used_cols + 1 - margin_cols)
+    top = max(1, rows - used_rows + 1 - margin_rows)
+    # width/height describe the AVAILABLE area, not the image: mpv fits the video
+    # inside it keeping the aspect ratio. Give both, because leaving width at 0
+    # falls back to 320 whenever mpv cannot read the terminal, which silently
+    # shrinks the picture.
     return [
-        f"--vo-kitty-cols={width}",
-        f"--vo-kitty-rows={height}",
-        f"--vo-kitty-left={max(1, cols - width)}",
-        f"--vo-kitty-top={max(1, rows - height)}",
+        f"--vo-kitty-width={(cols - left + 1) * cell_w}",
+        f"--vo-kitty-height={height_px}",
+        f"--vo-kitty-left={left}",
+        f"--vo-kitty-top={top}",
     ]
 
 
@@ -1192,7 +1241,9 @@ def build_mpv_command(
         "--mute=no",
         "--aid=auto",
         "--osd-duration=2000",
-        "--input-conf=" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "mpv-input.conf"),
+        # realpath, not abspath: installed as a symlink this must still resolve
+        # back to the repository, or every custom key binding silently dies.
+        "--input-conf=" + os.path.join(os.path.dirname(os.path.realpath(__file__)), "mpv-input.conf"),
         f"--audio-device={getattr(args, 'audio_device', 'auto')}",
         f"--network-timeout={getattr(args, 'timeout', 20)}",
         f"--ytdl-raw-options-append=socket-timeout={getattr(args, 'timeout', 20)}",
@@ -1241,7 +1292,11 @@ def build_mpv_command(
                 "--term-title=",
             ])
             if video_output == "kitty":
-                command.extend(stealth_kitty_placement())
+                command.extend(
+                    stealth_kitty_placement(
+                        getattr(args, "stealth_rows", STEALTH_HEIGHT_ROWS)
+                    )
+                )
         else:
             command.extend([
                 "--osd-level=1",
@@ -1293,16 +1348,19 @@ def play_video(video: Video, args: argparse.Namespace, mode: str = "video") -> i
         resolved_video_output=video_output,
         mpv_path=mpv,
     )
-    eprint(f"終端播放影片（{video_output}）：{video.title}" if mode == "video"
-           else f"視窗播放影片：{video.title}")
-    eprint("正在解析與載入影片；若持續沒有畫面，按 Ctrl-C 中止。")
-    if not getattr(args, "stealth", False):
+    if getattr(args, "stealth", False):
+        # Stealth means nothing on screen: no title, no URL, no hints.
+        eprint("載入中…")
+    else:
+        eprint(f"終端播放影片（{video_output}）：{video.title}" if mode == "video"
+               else f"視窗播放影片：{video.title}")
+        eprint("正在解析與載入影片；若持續沒有畫面，按 Ctrl-C 中止。")
         if video_output == "kitty":
             eprint("若 kitty 沒有畫面，可重開並指定 --video-output tct。")
         eprint("mpv：Space 暫停、←/→ 快退快進、9/0 音量、m 靜音、b 收畫面、q 離開")
-    if mode == "video":
-        eprint("terminal 內用鍵盤控制；需要滑鼠控制列請改用 --play-mode window。")
-    eprint(video.url)
+        if mode == "video":
+            eprint("terminal 內用鍵盤控制；需要滑鼠控制列請改用 --play-mode window。")
+        eprint(video.url)
     try:
         returncode = subprocess.run(command, check=False).returncode
     except OSError as exc:
@@ -1677,6 +1735,13 @@ def add_playback_arguments(parser: argparse.ArgumentParser) -> None:
         help="預設 kitty 圖片輸出；auto 自動判斷，tct 為字元方塊備用模式",
     )
     parser.add_argument(
+        "--stealth-rows",
+        type=int,
+        default=STEALTH_HEIGHT_ROWS,
+        metavar="N",
+        help=f"隱蔽畫面要佔幾列文字高，預設 {STEALTH_HEIGHT_ROWS}；視窗太小才會自動縮減",
+    )
+    parser.add_argument(
         "--kitty-shm",
         choices=("auto", "yes", "no"),
         default="auto",
@@ -1707,7 +1772,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("home", help="功能選單（搜尋、熱門、帳號等）")
-    subparsers.add_parser("doctor", help="檢查工具與設定，不顯示 cookies")
+    doctor = subparsers.add_parser("doctor", help="檢查工具與設定，不顯示 cookies")
+    doctor.add_argument("--terminal", action="store_true",
+                        help="只顯示終端機尺寸與隱蔽畫面的定位推算")
+    doctor.add_argument("--preview", action="store_true",
+                        help="在算出來的位置畫一張 16:9 測試圖，實際看定位對不對")
     subparsers.add_parser("logout", help="移除本機儲存的登入，不登出瀏覽器")
     status = subparsers.add_parser("status", help="驗證目前登入帳號")
     add_backend_arguments(status)
@@ -2309,6 +2378,60 @@ def run_favorites(args: argparse.Namespace, session: Session) -> int:
     return interactive_playback(args, [videos], title, page_loader=load_page)
 
 
+def report_terminal() -> int:
+    """What the stealth placement actually sees; assumptions here are easy to get wrong."""
+    metrics = terminal_metrics()
+    if not metrics:
+        print("無法取得終端機尺寸（可能不是 TTY）。")
+        return 1
+    cols, rows, cell_w, cell_h = metrics
+    try:
+        packed = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+        raw_rows, raw_cols, xpixel, ypixel = struct.unpack("HHHH", packed)
+    except (OSError, ValueError, AttributeError):
+        raw_rows = raw_cols = xpixel = ypixel = 0
+    print(f"TERM={os.environ.get('TERM', '')} "
+          f"TERM_PROGRAM={os.environ.get('TERM_PROGRAM', '')}")
+    print(f"TIOCGWINSZ 原始值：{raw_cols} 欄 x {raw_rows} 列，"
+          f"像素 {xpixel} x {ypixel}" + ("（終端機沒回報像素，使用預設值）" if not xpixel else ""))
+    print(f"推算字元大小：{cell_w} x {cell_h} 像素")
+    print(f"視窗像素推估：{cols * cell_w} x {rows * cell_h}")
+    placement = stealth_kitty_placement()
+    print("隱蔽畫面參數：" + " ".join(placement))
+    height = int(placement[0].split("=")[1])
+    if len(placement) > 1:
+        left = int(placement[1].split("=")[1])
+        top = int(placement[2].split("=")[1])
+        print(f"  預計佔 {-(-(height * 16 // 9) // cell_w)} 欄 x {-(-height // cell_h)} 列，"
+              f"右下角約在 (列 {top + -(-height // cell_h) - 1}, 欄 "
+              f"{left + -(-(height * 16 // 9) // cell_w) - 1})")
+    return 0
+
+
+def preview_stealth_placement(seconds: float = 4.0) -> int:
+    """Draw a 16:9 test pattern exactly where stealth would put the video.
+
+    Removes the guesswork: whatever lands on screen is what the current window
+    actually produces, with no network and no resizing in between.
+    """
+    mpv = find_mpv(None)
+    if "kitty" not in probe_mpv_video_outputs(mpv):
+        raise SystemExit("這份 mpv 沒有 kitty video output，無法預覽定位。")
+    command = [
+        mpv, "--no-config", "--really-quiet", "--ao=null",
+        "--vo=kitty", f"--vo-kitty-use-shm={'yes' if terminal_supports_kitty_shm() else 'no'}",
+        *stealth_kitty_placement(),
+        f"--length={seconds}",
+        "av://lavfi:testsrc2=size=1920x1080:rate=10",
+    ]
+    eprint(f"畫一個 16:9 測試圖 {seconds:.0f} 秒，請看它有沒有貼齊右下角。")
+    try:
+        subprocess.run(command, check=False)
+    except OSError as exc:
+        raise SystemExit(f"無法執行 mpv：{exc}") from exc
+    return 0
+
+
 def run_doctor() -> int:
     missing = []
     print(f"Python：{sys.version.split()[0]}")
@@ -2366,7 +2489,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "home":
         return run_home()
     if args.command == "doctor":
-        return run_doctor()
+        if args.preview:
+            report_terminal()
+            return preview_stealth_placement()
+        return report_terminal() if args.terminal else run_doctor()
     if args.command == "login":
         return run_login(args)
     if args.command == "logout":

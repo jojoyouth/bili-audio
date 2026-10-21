@@ -275,6 +275,95 @@ class PlayerTests(unittest.TestCase):
         command = bili_audio.build_mpv_command(self.video, self.args, "video")
         self.assertIn("--msg-level=all=info,osd/libass=fatal", command)
 
+    def test_input_conf_resolves_through_a_symlink(self) -> None:
+        # Installed as ~/.local/bin/bili-audio, abspath would look for the key
+        # bindings next to the symlink and every custom key would die silently.
+        command = bili_audio.build_mpv_command(self.video, self.args, "video")
+        conf = [item for item in command if item.startswith("--input-conf=")][0]
+        expected = os.path.join(
+            os.path.dirname(os.path.realpath(bili_audio.__file__)), "mpv-input.conf"
+        )
+        self.assertEqual(conf, f"--input-conf={expected}")
+        self.assertTrue(os.path.exists(expected), "mpv-input.conf 應該在 repo 裡")
+
+    def test_stealth_size_does_not_follow_the_window(self) -> None:
+        # Snapping from half-screen to a bottom-right quarter must keep the same
+        # picture, not shrink it along with the terminal.
+        heights = []
+        for cols, rows in ((90, 52), (90, 26), (60, 17)):
+            with mock.patch.object(bili_audio, "terminal_metrics",
+                                   return_value=(cols, rows, 8, 17)):
+                placement = bili_audio.stealth_kitty_placement()
+            heights.append(int([item for item in placement
+                                if item.startswith("--vo-kitty-height=")][0].split("=")[1]))
+        self.assertEqual(heights, [bili_audio.STEALTH_HEIGHT_ROWS * 17] * 3)
+
+    def test_stealth_size_shrinks_only_when_it_cannot_fit(self) -> None:
+        with mock.patch.object(bili_audio, "terminal_metrics",
+                               return_value=(30, 12, 8, 17)):
+            placement = bili_audio.stealth_kitty_placement()
+        height = int([item for item in placement
+                      if item.startswith("--vo-kitty-height=")][0].split("=")[1])
+        self.assertLess(height, bili_audio.STEALTH_HEIGHT_ROWS * 17)
+        self.assertGreaterEqual(height, 34)
+
+    def test_stealth_size_is_configurable(self) -> None:
+        args = bili_audio.parse_args(["recommend", "--stealth", "--stealth-rows", "6"])
+        self.assertEqual(args.stealth_rows, 6)
+        with mock.patch.object(bili_audio, "terminal_metrics",
+                               return_value=(90, 52, 8, 17)):
+            command = bili_audio.build_mpv_command(
+                self.video, args, "video", resolved_video_output="kitty"
+            )
+        self.assertIn("--vo-kitty-height=102", command)
+
+    def test_stealth_sits_against_the_corner(self) -> None:
+        # mpv positions with ESC[top;leftf, which is 1-based, and transmits with
+        # C=1 on the alternate screen, so the last column is safe to use.
+        # Metrics here are what Ghostty actually reported.
+        for cols, rows, cell_w, cell_h in ((110, 26, 17, 37), (90, 52, 17, 37),
+                                           (110, 13, 17, 37), (80, 24, 8, 17)):
+            with mock.patch.object(bili_audio, "terminal_metrics",
+                                   return_value=(cols, rows, cell_w, cell_h)):
+                placement = dict(
+                    item.removeprefix("--vo-kitty-").split("=")
+                    for item in bili_audio.stealth_kitty_placement()
+                )
+            height = int(placement["height"])
+            left, top = int(placement["left"]), int(placement["top"])
+            used_rows = -(-height // cell_h)
+            used_cols = -(-(height * 16 // 9) // cell_w)
+            last_row, last_col = top + used_rows - 1, left + used_cols - 1
+            self.assertLessEqual(last_row, rows - 1, f"{cols}x{rows} 超出底部")
+            self.assertLessEqual(last_col, cols, f"{cols}x{rows} 超出右緣")
+            if used_cols <= cols:
+                self.assertEqual(last_col, cols, f"{cols}x{rows} 沒有貼齊右緣")
+            self.assertGreaterEqual(top, 1)
+
+    def test_stealth_placement_stays_inside_the_terminal(self) -> None:
+        # mpv keeps the aspect ratio and ignores a cell box, so the reserved
+        # area has to cover the widest shape it can return.
+        for cols, rows, cell_w, cell_h in ((120, 40, 8, 17), (80, 24, 10, 20),
+                                           (200, 50, 7, 15)):
+            with mock.patch.object(bili_audio, "terminal_metrics",
+                                   return_value=(cols, rows, cell_w, cell_h)):
+                placement = dict(
+                    item.removeprefix("--vo-kitty-").split("=")
+                    for item in bili_audio.stealth_kitty_placement()
+                )
+            height_px = int(placement["height"])
+            left, top = int(placement["left"]), int(placement["top"])
+            used_rows = -(-height_px // cell_h)
+            used_cols = -(-(height_px * 16 // 9) // cell_w)
+            self.assertLessEqual(top + used_rows - 1, rows - 1, f"{cols}x{rows} 垂直超出")
+            self.assertLessEqual(left + used_cols - 1, cols, f"{cols}x{rows} 水平超出")
+            self.assertGreaterEqual(height_px, cell_h * 2)
+
+    def test_stealth_placement_survives_an_unknown_terminal(self) -> None:
+        with mock.patch.object(bili_audio, "terminal_metrics", return_value=None):
+            self.assertEqual(bili_audio.stealth_kitty_placement(),
+                             [f"--vo-kitty-height={bili_audio.STEALTH_HEIGHT_ROWS * 17}"])
+
     def test_max_height_is_opt_in(self) -> None:
         command = bili_audio.build_mpv_command(self.video, self.args, "video")
         self.assertIn("--ytdl-format=bestvideo+bestaudio/best", command)
@@ -284,7 +373,8 @@ class PlayerTests(unittest.TestCase):
 
     def test_stealth_hides_osd_and_shrinks_the_picture(self) -> None:
         self.args.stealth = True
-        with mock.patch.object(bili_audio, "terminal_cells", return_value=(120, 40)):
+        with mock.patch.object(bili_audio, "terminal_metrics",
+                               return_value=(120, 40, 8, 17)):
             command = bili_audio.build_mpv_command(
                 self.video, self.args, "video", resolved_video_output="kitty"
             )
@@ -293,8 +383,34 @@ class PlayerTests(unittest.TestCase):
         self.assertIn("--term-title=", command)
         self.assertNotIn("--osd-level=1", command)
         self.assertFalse([item for item in command if item.startswith("--osd-msg1=")])
-        self.assertTrue([item for item in command if item.startswith("--vo-kitty-cols=")])
+        self.assertTrue([item for item in command if item.startswith("--vo-kitty-height=")])
         self.assertTrue([item for item in command if item.startswith("--vo-kitty-left=")])
+        # A forced cell box would make mpv overflow the corner and get clipped.
+        self.assertFalse([item for item in command if item.startswith("--vo-kitty-cols=")])
+
+    def test_stealth_prints_no_title_or_url(self) -> None:
+        self.args.stealth = True
+        with mock.patch("bili_audio.subprocess.run") as runner, \
+             mock.patch("bili_audio.find_mpv", return_value="/bin/echo"), \
+             mock.patch("bili_audio.resolve_mpv_video_output", return_value="kitty"), \
+             mock.patch("bili_audio.terminal_is_interactive", return_value=True), \
+             contextlib.redirect_stderr(io.StringIO()) as errors:
+            runner.return_value = mock.Mock(returncode=0)
+            bili_audio.play_video(self.video, self.args)
+        printed = errors.getvalue()
+        self.assertNotIn(self.video.url, printed)
+        self.assertNotIn(self.video.title, printed)
+        self.assertNotIn("--play-mode window", printed)
+
+    def test_normal_mode_still_shows_the_url(self) -> None:
+        with mock.patch("bili_audio.subprocess.run") as runner, \
+             mock.patch("bili_audio.find_mpv", return_value="/bin/echo"), \
+             mock.patch("bili_audio.resolve_mpv_video_output", return_value="tct"), \
+             mock.patch("bili_audio.terminal_is_interactive", return_value=True), \
+             contextlib.redirect_stderr(io.StringIO()) as errors:
+            runner.return_value = mock.Mock(returncode=0)
+            bili_audio.play_video(self.video, self.args)
+        self.assertIn(self.video.url, errors.getvalue())
 
     def test_stealth_leaves_audio_mode_untouched(self) -> None:
         self.args.stealth = True
