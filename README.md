@@ -330,11 +330,56 @@ kitty 圖片輸出有兩種傳輸方式，`--kitty-shm` 預設 `auto`：
 ./bili_audio.py --video-output tct
 ```
 
-## 隱蔽播放
+## 浮動小視窗（推薦的摸魚方式）
+
+```bash
+bili-audio --play-mode float
+bili-audio --play-mode float --float-size 20   # 最大佔螢幕 20%
+```
+
+開一個無邊框、置頂的 mpv 小視窗，釘在**螢幕**右下角：
+
+- 對齊的是螢幕角落而不是 terminal，所以 terminal 佔右半邊或只佔右下 1/4，
+  小視窗都在同一個位置（兩種佈局共用螢幕右下角）
+- GPU 繪圖加 VideoToolbox 硬解，沒有 terminal 圖片協定的速度上限
+- 視窗比例跟著影片，不會變形也不會被裁切；之後可直接用滑鼠拖動
+- 開啟時不搶焦點（繼續在 terminal 打字），Dock 不出現 mpv 圖示，
+  視窗標題顯示 `zsh` 而不是片名
+- terminal 只印一行「載入中…」，播放紀錄與續播位置照常運作
+
+terminal 會停在這一部播完（或在小視窗按 `q`）才回到清單，想同時做事請開另一個分頁。
+
+### 全域 boss key
+
+```bash
+bili-audio boss    # 收起：暫停＋靜音＋縮小；再執行一次就還原
+```
+
+不用切到小視窗就能操作，透過 mpv 的 IPC socket（`~/.config/bili-audio/mpv.sock`）。
+還原時會恢復收起前的靜音狀態，原本就靜音的不會被打開。
+
+綁成全域快捷鍵（macOS 內建「捷徑」App，不用另外安裝東西）：
+
+1. 打開「捷徑」→ 新增捷徑 → 加入動作「執行 Shell 指令碼」
+2. 內容填：
+
+   ```bash
+   /opt/homebrew/bin/python3 "$HOME/.local/bin/bili-audio" boss
+   ```
+
+   **要寫 Homebrew 的 python3 完整路徑。** 「捷徑」執行時的 PATH 會先找到
+   系統內建的 `/usr/bin/python3`（3.9），這個專案需要 3.10 以上。
+3. 捷徑資訊 → 加入鍵盤快速鍵
+4. 第一次執行時 macOS 會要求允許執行指令碼，在「捷徑」設定的「進階」裡開啟
+
+## 隱蔽播放（terminal 內）
 
 ```bash
 ./bili_audio.py --stealth
 ```
+
+不想開額外視窗時用，例如透過 SSH。畫面走 terminal 圖片協定，
+所以有速度上限，位置也只在啟動時計算；一般情況建議用上面的 `--play-mode float`。
 
 畫面貼在右下角，關掉 OSD；不印片名、網址與操作提示，只留一行「載入中…」。
 

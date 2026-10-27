@@ -1016,6 +1016,169 @@ class WatchlaterFavoriteTests(unittest.TestCase):
         session.request.assert_not_called()
 
 
+class FakeMpv:
+    """A tiny mpv JSON IPC server holding just the properties boss touches."""
+
+    def __init__(self, path: str) -> None:
+        import socket
+        import threading
+
+        self.state = {"pause": False, "mute": False, "window-minimized": False}
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(path)
+        self.server.listen()
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self) -> None:
+        while True:
+            try:
+                connection, _ = self.server.accept()
+            except OSError:
+                return
+            with connection:
+                buffer = b""
+                while True:
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        command = json.loads(line)["command"]
+                        # An async event first, the way real mpv interleaves them.
+                        connection.sendall(b'{"event":"property-change"}\n')
+                        if command[0] == "get_property":
+                            reply = {"error": "success", "data": self.state.get(command[1])}
+                        else:
+                            self.state[command[1]] = command[2]
+                            reply = {"error": "success"}
+                        connection.sendall((json.dumps(reply) + "\n").encode())
+
+    def close(self) -> None:
+        self.server.close()
+
+
+class FloatWindowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Short on purpose: macOS caps a socket path at 104 bytes.
+        self.directory = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(self.directory.cleanup)
+        environment = mock.patch.dict(
+            os.environ,
+            {"BILI_AUDIO_CONFIG_DIR": self.directory.name,
+             "PATH": os.environ.get("PATH", "")},
+            clear=True,
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.video = bili_audio.Video(
+            title="不該出現的片名", author="UP", bvid="BV1ABcsztEcY", aid="",
+            url="https://www.bilibili.com/video/BV1ABcsztEcY",
+            duration="01:00", play=1, pubdate=None, description="",
+        )
+
+    def test_float_window_is_pinned_to_the_screen_corner(self) -> None:
+        args = bili_audio.parse_args(["hot", "--play-mode", "float"])
+        command = bili_audio.build_mpv_command(self.video, args, "float")
+        for option in ("--geometry=100%:100%", "--autofit=28%", "--ontop",
+                       "--border=no", "--title=zsh", "--focus-on=never",
+                       "--macos-app-activation-policy=accessory", "--hwdec=auto-safe"):
+            self.assertIn(option, command)
+        self.assertIn(f"--input-ipc-server={bili_audio.ipc_socket_path()}", command)
+        # Resume and history behave the same as every other mode.
+        self.assertIn("--save-position-on-quit=yes", command)
+        self.assertFalse([item for item in command if item.startswith("--vo=")])
+
+    def test_float_size_is_configurable_and_bounded(self) -> None:
+        args = bili_audio.parse_args(["hot", "--play-mode", "float", "--float-size", "40"])
+        self.assertIn("--autofit=40%", bili_audio.build_mpv_command(self.video, args, "float"))
+        for bad in ("2", "150"):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                bili_audio.parse_args(["hot", "--float-size", bad])
+
+    def test_a_long_config_path_skips_ipc_instead_of_breaking_mpv(self) -> None:
+        with mock.patch.dict(os.environ, {"BILI_AUDIO_CONFIG_DIR": "/tmp/" + "x" * 120}):
+            self.assertIsNone(bili_audio.ipc_socket_path())
+            command = bili_audio.build_mpv_command(
+                self.video, bili_audio.parse_args(["hot"]), "float"
+            )
+        self.assertFalse([item for item in command if "ipc-server" in item])
+
+    def test_float_needs_no_tty_and_prints_no_title_or_url(self) -> None:
+        args = bili_audio.parse_args(["hot", "--play-mode", "float"])
+        with mock.patch("bili_audio.subprocess.run") as runner, \
+             mock.patch("bili_audio.find_mpv", return_value="/bin/echo"), \
+             mock.patch("bili_audio.terminal_is_interactive", return_value=False), \
+             contextlib.redirect_stderr(io.StringIO()) as errors:
+            runner.return_value = mock.Mock(returncode=0)
+            self.assertEqual(bili_audio.play_selected(self.video, args), 0)
+        self.assertIn("--geometry=100%:100%", runner.call_args.args[0])
+        self.assertNotIn(self.video.url, errors.getvalue())
+        self.assertNotIn(self.video.title, errors.getvalue())
+
+    def test_stale_socket_is_removed_before_mpv_starts(self) -> None:
+        socket_path = bili_audio.ipc_socket_path()
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        socket_path.write_text("left over")
+        args = bili_audio.parse_args(["hot", "--play-mode", "float"])
+        with mock.patch("bili_audio.subprocess.run", return_value=mock.Mock(returncode=0)), \
+             mock.patch("bili_audio.find_mpv", return_value="/bin/echo"), \
+             contextlib.redirect_stderr(io.StringIO()):
+            bili_audio.play_video(self.video, args, mode="float")
+        self.assertFalse(socket_path.exists())
+
+    def test_boss_without_a_player(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(bili_audio.run_boss(bili_audio.parse_args(["boss"])), 1)
+        self.assertIn("沒有正在播放", output.getvalue())
+
+    def test_boss_clears_a_socket_nobody_listens_on(self) -> None:
+        import socket
+
+        socket_path = bili_audio.ipc_socket_path()
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        dead.bind(str(socket_path))
+        dead.close()  # The file stays, but nothing accepts connections.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bili_audio.run_boss(bili_audio.parse_args(["boss"])), 1)
+        self.assertFalse(socket_path.exists())
+
+    def test_boss_hides_then_restores_without_touching_a_manual_mute(self) -> None:
+        socket_path = bili_audio.ipc_socket_path()
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        player = FakeMpv(str(socket_path))
+        self.addCleanup(player.close)
+        player.state["mute"] = True  # Muted on purpose before hiding.
+
+        args = bili_audio.parse_args(["boss"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bili_audio.run_boss(args), 0)
+        self.assertEqual(
+            {k: player.state[k] for k in ("pause", "mute", "window-minimized")},
+            {"pause": True, "mute": True, "window-minimized": True},
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bili_audio.run_boss(args), 0)
+        self.assertEqual(
+            {k: player.state[k] for k in ("pause", "mute", "window-minimized")},
+            {"pause": False, "mute": True, "window-minimized": False},
+        )
+
+    def test_boss_restores_sound_that_it_muted_itself(self) -> None:
+        socket_path = bili_audio.ipc_socket_path()
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        player = FakeMpv(str(socket_path))
+        self.addCleanup(player.close)
+        args = bili_audio.parse_args(["boss"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            bili_audio.run_boss(args)
+            self.assertTrue(player.state["mute"])
+            bili_audio.run_boss(args)
+        self.assertFalse(player.state["mute"])
+
+
 class CompletionTests(unittest.TestCase):
     def test_commands_match_parser(self) -> None:
         # A new subparser that is missing from COMMANDS gets treated as a

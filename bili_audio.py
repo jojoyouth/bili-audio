@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
 import fcntl
@@ -50,6 +51,11 @@ HISTORY_LIMIT = 200
 # pixels so it looks the same on a Retina panel, where one cell is twice as many
 # pixels, and stays put when the window is resized.
 STEALTH_HEIGHT_ROWS = 14
+FLOAT_SIZE_PERCENT = 28
+# Shown in Mission Control and the window switcher instead of the video title.
+FLOAT_TITLE = "zsh"
+# sun_path is 104 bytes on macOS; mpv cannot listen on anything longer.
+MAX_SOCKET_PATH = 100
 _history_warned = False
 OSC_SEQUENCE_RE = re.compile(
     r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|$)",
@@ -1144,6 +1150,44 @@ def terminal_is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
+def ipc_socket_path() -> Path | None:
+    path = config_dir() / "mpv.sock"
+    return path if len(str(path)) <= MAX_SOCKET_PATH else None
+
+
+def float_window_options(args: argparse.Namespace) -> list[str]:
+    """A borderless always-on-top window pinned to the screen's bottom-right.
+
+    Anchoring to the screen rather than the terminal is what makes it land in
+    the same spot whether the terminal fills the right half or only the
+    bottom-right quarter: both share that corner. mpv draws it on the GPU, so
+    none of the terminal-graphics limits apply.
+    """
+    options = [
+        "--no-config",
+        "--force-window=yes",
+        "--geometry=100%:100%",
+        f"--autofit={getattr(args, 'float_size', FLOAT_SIZE_PERCENT)}%",
+        "--ontop",
+        "--border=no",
+        f"--title={FLOAT_TITLE}",
+        # Keep typing in the terminal when the window opens, and keep mpv out
+        # of the Dock.
+        "--focus-on=never",
+        "--macos-app-activation-policy=accessory",
+        "--hwdec=auto-safe",
+        "--osc=no",
+        "--osd-level=1",
+        # Info level prints the URL and the track list into the terminal.
+        "--msg-level=all=warn,osd/libass=fatal",
+        "--ytdl-format=bestvideo+bestaudio/best",
+    ]
+    socket_path = ipc_socket_path()
+    if socket_path:
+        options.append(f"--input-ipc-server={socket_path}")
+    return options
+
+
 def terminal_ytdl_format(args: argparse.Namespace) -> str:
     """Highest available stream by default; --max-height trades detail for throughput."""
     max_height = getattr(args, "max_height", 0) or 0
@@ -1259,6 +1303,8 @@ def build_mpv_command(
     elif mode == "window":
         command.extend(["--no-config", "--force-window=yes", "--osc=yes",
                         "--osd-level=1", "--ytdl-format=bestvideo+bestaudio/best"])
+    elif mode == "float":
+        command.extend(float_window_options(args))
     else:
         video_output = resolved_video_output or terminal_video_output(
             args.video_output
@@ -1348,7 +1394,13 @@ def play_video(video: Video, args: argparse.Namespace, mode: str = "video") -> i
         resolved_video_output=video_output,
         mpv_path=mpv,
     )
-    if getattr(args, "stealth", False):
+    if mode == "float":
+        # mpv leaves the socket file behind even after a clean exit.
+        socket_path = ipc_socket_path()
+        if socket_path:
+            with contextlib.suppress(OSError):
+                socket_path.unlink()
+    if getattr(args, "stealth", False) or mode == "float":
         # Stealth means nothing on screen: no title, no URL, no hints.
         eprint("載入中…")
     else:
@@ -1382,8 +1434,8 @@ def play_selected(
         mode = "video"
     else:
         mode = args.play_mode
-    if mode in ("video", "window"):
-        return play_video(video, args) if mode == "video" else play_video(video, args, mode="window")
+    if mode in ("video", "window", "float"):
+        return play_video(video, args, mode=mode)
     return play_audio(video, args)
 
 
@@ -1497,7 +1549,7 @@ def interactive_playback(
 # Must stay in step with build_parser's subcommands; test_commands_match_parser checks it.
 COMMANDS = {"search", "users", "user", "hot", "rank", "backend-info", "history",
             "login", "logout", "status", "recommend", "home", "doctor", "completion",
-            "watchlater", "favorites", "install"}
+            "watchlater", "favorites", "install", "boss"}
 
 
 def parser_subcommands(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
@@ -1632,6 +1684,74 @@ def run_install(args: argparse.Namespace) -> int:
     return 0
 
 
+def mpv_ipc(socket_path: Path, *commands: list[Any]) -> list[dict[str, Any]]:
+    """Send commands over mpv's JSON IPC and collect the replies in order."""
+    import socket
+
+    replies: list[dict[str, Any]] = []
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(2)
+        connection.connect(str(socket_path))
+        buffer = b""
+        for command in commands:
+            connection.sendall((json.dumps({"command": command}) + "\n").encode())
+            while True:
+                while b"\n" not in buffer:
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        raise ConnectionError("mpv closed the IPC connection")
+                    buffer += chunk
+                line, buffer = buffer.split(b"\n", 1)
+                message = json.loads(line)
+                if "event" not in message:  # Skip async events between replies.
+                    replies.append(message)
+                    break
+    return replies
+
+
+def run_boss(args: argparse.Namespace) -> int:
+    """Toggle the float window away and back. Meant for a global shortcut."""
+    socket_path = ipc_socket_path()
+    if not socket_path or not socket_path.exists():
+        print("沒有正在播放的浮動視窗。")
+        return 1
+    try:
+        hidden, muted = mpv_ipc(
+            socket_path,
+            ["get_property", "window-minimized"],
+            ["get_property", "mute"],
+        )
+        if hidden.get("data"):
+            saved = mpv_ipc(socket_path, ["get_property", "user-data/bili-audio/mute"])[0]
+            mpv_ipc(
+                socket_path,
+                ["set_property", "window-minimized", False],
+                ["set_property", "mute", bool(saved.get("data", False))],
+                ["set_property", "pause", False],
+            )
+            print("已還原。")
+        else:
+            mpv_ipc(
+                socket_path,
+                # Remember whether it was muted before, so restoring does not
+                # unmute something the user had muted on purpose.
+                ["set_property", "user-data/bili-audio/mute", bool(muted.get("data"))],
+                ["set_property", "pause", True],
+                ["set_property", "mute", True],
+                ["set_property", "window-minimized", True],
+            )
+            print("已收起。")
+    except (ConnectionRefusedError, FileNotFoundError):
+        # mpv leaves the socket file behind after it exits.
+        with contextlib.suppress(OSError):
+            socket_path.unlink()
+        print("沒有正在播放的浮動視窗。")
+        return 1
+    except (OSError, ValueError, ConnectionError) as exc:
+        raise SystemExit(f"無法控制浮動視窗：{exc}") from exc
+    return 0
+
+
 def run_completion(args: argparse.Namespace) -> int:
     if args.list:
         for name, flags in completion_table():
@@ -1724,9 +1844,17 @@ def add_playback_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--play-mode",
-        choices=("audio", "video", "window"),
+        choices=("audio", "video", "window", "float"),
         default="video",
-        help="Enter／--first 的模式：預設 video 終端影片；audio 音訊、window 滑鼠控制視窗",
+        help="Enter／--first 的模式：預設 video 終端影片；audio 音訊、window 滑鼠控制視窗、"
+             "float 螢幕右下角的無邊框置頂小視窗",
+    )
+    parser.add_argument(
+        "--float-size",
+        type=int,
+        default=FLOAT_SIZE_PERCENT,
+        metavar="PERCENT",
+        help=f"float 視窗最大佔螢幕的百分比，預設 {FLOAT_SIZE_PERCENT}；比例由影片決定",
     )
     parser.add_argument(
         "--video-output",
@@ -1838,6 +1966,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_playback_arguments(favorites)
     favorites.set_defaults(limit=0)
 
+    subparsers.add_parser(
+        "boss", help="收起或還原 float 浮動視窗（暫停＋靜音＋縮到 Dock），適合綁全域快捷鍵",
+    )
+
     install = subparsers.add_parser(
         "install", help=f"把自己連結成 {CLI_NAME} 指令並安裝 zsh 補全",
     )
@@ -1917,6 +2049,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     volume = getattr(args, "volume", 40)
     if not 0 <= volume <= 100:
         parser.error("--volume 必須介於 0 和 100")
+    if not 5 <= getattr(args, "float_size", FLOAT_SIZE_PERCENT) <= 100:
+        parser.error("--float-size 必須介於 5 和 100")
     return args
 
 
@@ -2486,6 +2620,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_completion(args)
     if args.command == "install":
         return run_install(args)
+    if args.command == "boss":
+        return run_boss(args)
     if args.command == "home":
         return run_home()
     if args.command == "doctor":
